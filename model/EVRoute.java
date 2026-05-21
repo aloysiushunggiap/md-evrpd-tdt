@@ -28,6 +28,7 @@ public class EVRoute {
     public List<Double> departureTimes;
     public List<Double> loads;
     public Map<Integer, Double> departureTimeByCustomerNode;
+    public Map<Integer, Double> arrivalTimeByCustomerNode;
 
     public double energyUsed;
     public double totalCost;
@@ -45,6 +46,7 @@ public class EVRoute {
         this.departureTimes = new ArrayList<>();
         this.loads = new ArrayList<>();
         this.departureTimeByCustomerNode = new HashMap<>();
+        this.arrivalTimeByCustomerNode = new HashMap<>();
     }
 
     /**
@@ -67,6 +69,8 @@ public class EVRoute {
         this.loads = new ArrayList<>(other.loads);
         this.departureTimeByCustomerNode =
                 new HashMap<>(other.departureTimeByCustomerNode);
+        this.arrivalTimeByCustomerNode =
+                new HashMap<>(other.arrivalTimeByCustomerNode);
         this.energyUsed = other.energyUsed;
         this.totalCost = other.totalCost;
         this.feasible = other.feasible;
@@ -153,6 +157,31 @@ public class EVRoute {
         }
 
         Double t = departureTimeByCustomerNode.get(nodeId);
+        if (t != null) {
+            return t;
+        }
+
+        if (nodeId == endDepotId) {
+            return arrivalTimes.get(arrivalTimes.size() - 1);
+        }
+
+        return 0.0;
+    }
+
+
+    /**
+     * Thời điểm EV đến node.
+     */
+    public double getArrivalAtNode(int nodeId) {
+        if (arrivalTimes.isEmpty()) {
+            return 0.0;
+        }
+
+        if (nodeId == startDepotId) {
+            return arrivalTimes.get(0);
+        }
+
+        Double t = arrivalTimeByCustomerNode.get(nodeId);
         if (t != null) {
             return t;
         }

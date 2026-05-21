@@ -292,7 +292,7 @@ public class Decoder {
             return false;
         }
 
-        return true;
+        return routeDroneCarryFeasible(route);
     }
 
     // ==========================================================
@@ -916,13 +916,16 @@ public class Decoder {
         double hover = 0.0;
 
         if (retrieveRoute != null) {
+            double evArrivalAtRetrieve = retrieveRoute.getArrivalAtNode(retrieveNodeId);
             double evDepartAtRetrieve = retrieveRoute.getDepartureAtNode(retrieveNodeId);
 
+            // Eq.(26): drone phải land trước khi EV rời retrieve node.
             if (rawArrive > evDepartAtRetrieve + 1e-9) {
                 return null;
             }
 
-            hover = Math.max(0.0, evDepartAtRetrieve - rawArrive);
+            // Paper: drone chỉ hover nếu đến trước EV; nếu đến trong service window thì không hover.
+            hover = Math.max(0.0, evArrivalAtRetrieve - rawArrive);
         } else {
             if (rawArrive > Constants.T_END + 1e-9) {
                 return null;
@@ -1050,6 +1053,7 @@ public class Decoder {
         route.departureTimes.clear();
         route.loads.clear();
         route.departureTimeByCustomerNode.clear();
+        route.arrivalTimeByCustomerNode.clear();
 
         Node pos = startDepot;
         double time = Constants.T_START;
@@ -1081,6 +1085,7 @@ public class Decoder {
 
             route.arrivalTimes.add(arrive);
             route.departureTimes.add(depart);
+            route.arrivalTimeByCustomerNode.put(cid, arrive);
             route.departureTimeByCustomerNode.put(cid, depart);
             route.loads.add(Math.max(0.0, remainingLoad));
 
@@ -1425,6 +1430,8 @@ public class Decoder {
                             + TimeUtil.droneTravelTime(d1 + d2)
                             + 4.0 * Constants.DRONE_T1;
 
+                    double evArrivalAtRetrieve =
+                            route.getArrivalAtNode(retrieveNodeId);
                     double evDepartAtRetrieve =
                             route.getDepartureAtNode(retrieveNodeId);
 
@@ -1433,7 +1440,8 @@ public class Decoder {
                         continue;
                     }
 
-                    double hover = Math.max(0.0, evDepartAtRetrieve - rawArrive);
+                    // Paper: hover chỉ tính khi drone đến trước EV, không phải chờ tới EV rời node.
+                    double hover = Math.max(0.0, evArrivalAtRetrieve - rawArrive);
                     double energy = EnergyUtil.droneEnergy(d1, d2, hover);
 
                     DroneTrip candidate = new DroneTrip(trip);
@@ -1610,7 +1618,73 @@ public class Decoder {
             }
         }
 
-        return true;
+        return routeDroneCarryFeasible(route);
+    }
+
+    /**
+     * Eq.(15)-(17): trên mỗi cung, một EV chỉ được carry tối đa một drone.
+     * Với cùng một node, thứ tự thao tác được phép linh hoạt theo Fig.3 của paper:
+     * launch drone đang carry, retrieve drone khác, rồi có thể relaunch drone vừa retrieve.
+     */
+    private static boolean routeDroneCarryFeasible(EVRoute route) {
+        int onboard = 1; // mỗi EV có thể rời depot với tối đa một drone; heuristic hiện dùng một drone seed/EV
+
+        for (int nodeId : route.customerIds) {
+            int launches = route.launchCountAtNode(nodeId);
+            int retrieves = route.retrieveCountAtNode(nodeId);
+
+            Node node = DataLoader.getNode(nodeId);
+            if (!node.isDepot) {
+                if (launches > 2 || retrieves > 1) {
+                    return false;
+                }
+                if (launches == 2 && retrieves != 1) {
+                    return false;
+                }
+            }
+
+            Integer next = feasibleOnboardAfterNode(onboard, launches, retrieves);
+            if (next == null) {
+                return false;
+            }
+            onboard = next;
+        }
+
+        return onboard >= 0 && onboard <= 1;
+    }
+
+    private static Integer feasibleOnboardAfterNode(int onboardBefore, int launches, int retrieves) {
+        return feasibleOnboardDfs(onboardBefore, launches, retrieves, new HashSet<>());
+    }
+
+    private static Integer feasibleOnboardDfs(int onboard, int launchesLeft, int retrievesLeft, Set<String> seen) {
+        if (onboard < 0 || onboard > 1) {
+            return null;
+        }
+        if (launchesLeft == 0 && retrievesLeft == 0) {
+            return onboard;
+        }
+
+        String key = onboard + "/" + launchesLeft + "/" + retrievesLeft;
+        if (!seen.add(key)) {
+            return null;
+        }
+
+        if (launchesLeft > 0 && onboard > 0) {
+            Integer afterLaunch = feasibleOnboardDfs(onboard - 1, launchesLeft - 1, retrievesLeft, seen);
+            if (afterLaunch != null) {
+                return afterLaunch;
+            }
+        }
+
+        if (retrievesLeft > 0 && onboard < 1) {
+            Integer afterRetrieve = feasibleOnboardDfs(onboard + 1, launchesLeft, retrievesLeft - 1, seen);
+            if (afterRetrieve != null) {
+                return afterRetrieve;
+            }
+        }
+
+        return null;
     }
 
     private static boolean singleDroneTripBasicFeasible(DroneTrip dt) {

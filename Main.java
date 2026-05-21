@@ -9,7 +9,7 @@ import java.util.Locale;
 public class Main {
 
     private static final String DEFAULT_DATA_DIR =
-            "C:\\Users\\DELL\\IdeaProjects\\retry\\src\\data";
+            "D:\\Nghien cuu thuat toan\\huyrebuild\\src\\data";
 
     public static void main(String[] args) {
 
@@ -21,7 +21,7 @@ public class Main {
          * - Truyền p04: chạy data/p04
          * - Truyền full path: chạy đúng path đó
          */
-        String instanceArg = args.length > 0 ? args[0].trim() : "p04";
+        String instanceArg = args.length > 0 ? args[0].trim() : "p02";
 
         String path;
         File directFile = new File(instanceArg);

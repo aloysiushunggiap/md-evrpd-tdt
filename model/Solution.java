@@ -66,6 +66,8 @@ public class Solution {
             newRoute.loads = new ArrayList<>(oldRoute.loads);
             newRoute.departureTimeByCustomerNode =
                     new HashMap<>(oldRoute.departureTimeByCustomerNode);
+            newRoute.arrivalTimeByCustomerNode =
+                    new HashMap<>(oldRoute.arrivalTimeByCustomerNode);
 
             newRoute.energyUsed = oldRoute.energyUsed;
             newRoute.totalCost = oldRoute.totalCost;

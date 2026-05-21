@@ -100,7 +100,7 @@ public class Constants {
     // Đây là upper bound heuristic, không phải ràng buộc paper.
     public static final int MAX_DEPOT_DRONES_PER_DEPOT = 4;
 
-    public static final int STAGE2_INSERT_NEAREST_POSITIONS = 4;
+    public static final int STAGE2_INSERT_NEAREST_POSITIONS = 2;
 
     // Stage 3 search window
     public static final int STAGE3_MAX_ROUNDS = 10;
@@ -109,6 +109,10 @@ public class Constants {
     public static final int STAGE3_RETRIEVE_CANDIDATES = 12;
 
     public static final double BIG_M = 1e6;
+
+    // Bật nếu dùng trực tiếp benchmark p02/p04 gốc của MDVRP như paper.
+    // Tắt nếu dữ liệu đầu vào đã được chỉnh demand sẵn.
+    public static final boolean NORMALIZE_PAPER_DEMAND = true;
 
     // =========================================================
     // PENALTY
@@ -131,6 +135,9 @@ public class Constants {
     public static final boolean ENABLE_ROUTE_MERGE = false;
     public static final int ROUTE_IMPROVE_GUARD = 2;
     public static final int MERGE_IMPROVE_GUARD = 2;
+
+    // Dừng sớm nếu nhiều generation liên tiếp không cải thiện best solution.
+    public static final int EARLY_STOP_PATIENCE = 100000;
     private Constants() {
     }
 }

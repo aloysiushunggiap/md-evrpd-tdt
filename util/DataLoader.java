@@ -171,7 +171,7 @@ public class DataLoader {
          * Paper tạo p01-p15 từ p02/p04 và có chỉnh demand.
          * Nếu dữ liệu đầu vào của anh đã chỉnh sẵn thì KHÔNG gọi hàm này.
          */
-        boolean paperInstance = name.matches("p\\d+");
+        boolean paperInstance = Constants.NORMALIZE_PAPER_DEMAND && name.matches("p\\d+");
 
         if (!paperInstance) {
             return rawDemand;

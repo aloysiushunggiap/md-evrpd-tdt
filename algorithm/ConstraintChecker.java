@@ -133,6 +133,10 @@ public class ConstraintChecker {
                     p += (e.getValue() - 1) * Constants.PENALTY_NODE_OPERATION;
                 }
             }
+
+            if (!routeDroneCarryFeasible(route)) {
+                p += Constants.PENALTY_NODE_OPERATION * 2.0;
+            }
         }
 
         // ======================================================
@@ -338,6 +342,11 @@ public class ConstraintChecker {
                             + " drones > 1");
                 }
             }
+
+            if (!routeDroneCarryFeasible(route)) {
+                out.add("Eq.15-17: EV" + route.evId
+                        + " carries more than one drone or launches without an onboard drone");
+            }
         }
 
         // ======================================================
@@ -513,6 +522,67 @@ public class ConstraintChecker {
         }
 
         return count;
+    }
+
+    private static boolean routeDroneCarryFeasible(EVRoute route) {
+        int onboard = 1;
+
+        for (int nodeId : route.customerIds) {
+            int launches = route.launchCountAtNode(nodeId);
+            int retrieves = route.retrieveCountAtNode(nodeId);
+
+            Node node = DataLoader.getNode(nodeId);
+            if (!node.isDepot) {
+                if (launches > 2 || retrieves > 1) {
+                    return false;
+                }
+                if (launches == 2 && retrieves != 1) {
+                    return false;
+                }
+            }
+
+            Integer next = feasibleOnboardAfterNode(onboard, launches, retrieves);
+            if (next == null) {
+                return false;
+            }
+            onboard = next;
+        }
+
+        return onboard >= 0 && onboard <= 1;
+    }
+
+    private static Integer feasibleOnboardAfterNode(int onboardBefore, int launches, int retrieves) {
+        return feasibleOnboardDfs(onboardBefore, launches, retrieves, new HashSet<>());
+    }
+
+    private static Integer feasibleOnboardDfs(int onboard, int launchesLeft, int retrievesLeft, Set<String> seen) {
+        if (onboard < 0 || onboard > 1) {
+            return null;
+        }
+        if (launchesLeft == 0 && retrievesLeft == 0) {
+            return onboard;
+        }
+
+        String key = onboard + "/" + launchesLeft + "/" + retrievesLeft;
+        if (!seen.add(key)) {
+            return null;
+        }
+
+        if (launchesLeft > 0 && onboard > 0) {
+            Integer afterLaunch = feasibleOnboardDfs(onboard - 1, launchesLeft - 1, retrievesLeft, seen);
+            if (afterLaunch != null) {
+                return afterLaunch;
+            }
+        }
+
+        if (retrievesLeft > 0 && onboard < 1) {
+            Integer afterRetrieve = feasibleOnboardDfs(onboard + 1, launchesLeft, retrievesLeft - 1, seen);
+            if (afterRetrieve != null) {
+                return afterRetrieve;
+            }
+        }
+
+        return null;
     }
 
     private static Map<Integer, List<DroneTrip>> tripsByDrone(Solution sol) {

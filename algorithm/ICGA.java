@@ -35,6 +35,7 @@ public class ICGA {
         population.sort(ICGA::compareIndividuals);
 
         Individual globalBest = cloneIndividual(population.get(0));
+        int stagnantGenerations = 0;
 
         for (int gen = 0; gen < maxGen; gen++) {
 
@@ -67,6 +68,7 @@ public class ICGA {
 
                     if (current.fitness + 1e-9 < globalBest.fitness) {
                         globalBest = cloneIndividual(current);
+                        stagnantGenerations = 0;
                     }
                 }
             }
@@ -103,6 +105,11 @@ public class ICGA {
                     bestSol.totalCustomersServedByEV(),
                     bestSol.totalCustomersServedByDrone()
             );
+
+            stagnantGenerations++;
+            if (stagnantGenerations >= Constants.EARLY_STOP_PATIENCE) {
+                break;
+            }
         }
 
         return globalBest.solution;
