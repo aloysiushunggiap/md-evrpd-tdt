@@ -21,7 +21,7 @@ public class Main {
          * - Truyền p04: chạy data/p04
          * - Truyền full path: chạy đúng path đó
          */
-        String instanceArg = args.length > 0 ? args[0].trim() : "p02";
+        String instanceArg = args.length > 0 ? args[0].trim() : "p03";
 
         String path;
         File directFile = new File(instanceArg);
