@@ -1,5 +1,5 @@
 import algorithm.ConstraintChecker;
-import algorithm.ICGA;
+import algorithm.GAVNS;
 import model.Solution;
 import util.DataLoader;
 
@@ -9,11 +9,11 @@ import java.util.Locale;
 public class Main {
 
     private static final String DEFAULT_DATA_DIR =
-            "C:\\Users\\DELL\\Downloads\\md-evrpd-tdt-master\\data";
+            "D:\\Nghien cuu thuat toan\\huyrebuild\\src\\data";
 
     public static void main(String[] args) {
 
-        System.out.println("=== MD-EVRPD-TDT Solver ===");
+        System.out.println("=== MD-EVRPD-TDT Solver (GA + VNS) ===");
 
         /*
          * Không truyền argument -> chạy p02
@@ -22,7 +22,7 @@ public class Main {
          */
 
         String instanceArg =
-                args.length > 0 ? args[0].trim() : "p03";
+                args.length > 0 ? args[0].trim() : "p04";
 
         String path;
 
@@ -44,7 +44,7 @@ public class Main {
         // ===== Start =====
         long start = System.currentTimeMillis();
 
-        Solution best = ICGA.solve();
+        Solution best = GAVNS.solve();
 
         long end = System.currentTimeMillis();
 
