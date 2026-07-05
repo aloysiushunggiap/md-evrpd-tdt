@@ -15,12 +15,7 @@ import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 
-/**
- * Hybrid Genetic Algorithm with Variable Neighborhood Search.
- *
- * The chromosome remains a permutation of customer ids. All objective and
- * constraint handling is still delegated to Decoder and ConstraintChecker.
- */
+
 public class GAVNS {
 
     private static final Random rand = new Random(42);

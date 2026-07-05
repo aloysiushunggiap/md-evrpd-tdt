@@ -15,14 +15,8 @@ public class Main {
 
         System.out.println("=== MD-EVRPD-TDT Solver (GA + VNS) ===");
 
-        /*
-         * Không truyền argument -> chạy p02
-         * Truyền p04 -> chạy data/p04
-         * Truyền full path -> chạy file đó
-         */
-
         String instanceArg =
-                args.length > 0 ? args[0].trim() : "p04";
+                args.length > 0 ? args[0].trim() : "p08";
 
         String path;
 
