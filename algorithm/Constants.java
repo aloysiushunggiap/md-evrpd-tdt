@@ -73,7 +73,7 @@ public class Constants {
     public static final double EV_ACCELERATION = 0.0;
 
     // =========================================================
-    // ICGA RANGE (paper)
+    // GA/VNS search range
     // =========================================================
     public static final int POP_SIZE_SMALL = 50;
     public static final int POP_SIZE_MEDIUM = 70;

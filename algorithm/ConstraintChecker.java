@@ -37,7 +37,7 @@ public class ConstraintChecker {
     }
 
     /**
-     * Penalty mềm để ICGA có gradient.
+     * Penalty mem de heuristic co gradient.
      * Không thay thế ràng buộc paper, chỉ giúp heuristic phân biệt nghiệm xấu/tốt.
      */
     public static double penalty(Solution sol) {

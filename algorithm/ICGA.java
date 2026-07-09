@@ -35,7 +35,6 @@ public class ICGA {
         population.sort(ICGA::compareIndividuals);
 
         Individual globalBest = cloneIndividual(population.get(0));
-        int stagnantGenerations = 0;
 
         for (int gen = 0; gen < maxGen; gen++) {
 
@@ -53,10 +52,10 @@ public class ICGA {
 
                     boolean accept;
 
-                    if (candidateFeasible && !currentFeasible) {
-                        accept = true;
-                    } else if (!candidateFeasible && currentFeasible) {
+                    if (!candidateFeasible) {
                         accept = false;
+                    } else if (!currentFeasible) {
+                        accept = true;
                     } else {
                         accept = candidate.fitness + 1e-9 < current.fitness;
                     }
@@ -68,7 +67,6 @@ public class ICGA {
 
                     if (current.fitness + 1e-9 < globalBest.fitness) {
                         globalBest = cloneIndividual(current);
-                        stagnantGenerations = 0;
                     }
                 }
             }
@@ -106,10 +104,6 @@ public class ICGA {
                     bestSol.totalCustomersServedByDrone()
             );
 
-            stagnantGenerations++;
-            if (stagnantGenerations >= Constants.EARLY_STOP_PATIENCE) {
-                break;
-            }
         }
 
         return globalBest.solution;
@@ -221,15 +215,14 @@ public class ICGA {
     }
 
     private static void evaluateIndividual(Individual ind) {
-        Solution sol = Decoder.decode(ind.chromosome);
+        Solution sol = Decoder.decodePaperICGA(ind.chromosome);
         ind.solution = sol;
 
         if (sol.feasible) {
             ind.fitness = sol.totalCost;
         } else {
-            // Paper: infeasible sau perturbation phải repair hoặc discard.
-            // Vì mình chưa có repair đầy đủ, cộng phạt lớn để không cho infeasible thắng feasible.
-            ind.fitness = sol.totalCost + sol.totalPenalty + 1_000_000.0;
+            // Paper: infeasible candidates are repaired by the decoder or discarded here.
+            ind.fitness = Double.POSITIVE_INFINITY;
         }
     }
 
@@ -290,12 +283,16 @@ public class ICGA {
             j = rand.nextInt(result.size());
         }
 
-        int customer = result.remove(i);
+        int customer = result.get(i);
+        int target = result.get(j);
 
-        if (j >= result.size()) {
+        result.remove(i);
+
+        int targetIndex = result.indexOf(target);
+        if (targetIndex < 0 || targetIndex + 1 >= result.size()) {
             result.add(customer);
         } else {
-            result.add(j, customer);
+            result.add(targetIndex + 1, customer);
         }
 
         return result;
