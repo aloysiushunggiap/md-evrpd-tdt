@@ -43,6 +43,38 @@ public class Decoder {
 
         return sol;
     }
+
+    public static Solution decodePaperICGA(List<Integer> chromosome) {
+        Solution sol = new Solution();
+
+        // Stage 1 in the paper: depot-centric clustering and depot-drone assignment.
+        Set<Integer> servedByDepotDrone = assignDepotDrones(sol, chromosome);
+
+        // Stage 2 in the paper: build EV routes inside each depot cluster, dispatching
+        // a new EV when capacity, SoC, or operating-hours constraints would be violated.
+        sol.evRoutes.addAll(buildPaperEVRoutes(chromosome, servedByDepotDrone));
+
+        pruneEmptyRoutes(sol);
+        assignPaperClosestEndDepots(sol);
+        refreshAllRoutes(sol);
+
+        // Stage 3 in the paper: node-by-node EV-drone collaborative integration.
+        assignPaperCollaborativeDroneTrips(sol);
+
+        computeCost(sol);
+        sol.totalPenalty = ConstraintChecker.penalty(sol);
+        sol.feasible = ConstraintChecker.isFeasible(sol);
+
+        if (!sol.feasible) {
+            repairPaperSolution(sol);
+        }
+
+        computeCost(sol);
+        sol.totalPenalty = ConstraintChecker.penalty(sol);
+        sol.feasible = ConstraintChecker.isFeasible(sol);
+
+        return sol;
+    }
     // ==========================================================
     // Stage 1: depot drones
     // ==========================================================
@@ -199,6 +231,100 @@ public class Decoder {
         }
 
         return routes;
+    }
+
+    private static List<EVRoute> buildPaperEVRoutes(List<Integer> chromosome,
+                                                    Set<Integer> servedByDepotDrone) {
+        List<EVRoute> routes = new ArrayList<>();
+        Map<Integer, List<Integer>> clusters = new LinkedHashMap<>();
+
+        List<Node> depots = new ArrayList<>(DataLoader.depots);
+        depots.sort(Comparator.comparingInt(d -> d.id));
+        for (Node depot : depots) {
+            clusters.put(depot.id, new ArrayList<>());
+        }
+
+        for (int cid : chromosome) {
+            if (servedByDepotDrone.contains(cid)) {
+                continue;
+            }
+            Node depot = nearestDepot(DataLoader.getCustomer(cid));
+            clusters.get(depot.id).add(cid);
+        }
+
+        int nextEvId = 1;
+        for (Node depot : depots) {
+            List<Integer> clusterCustomers = clusters.get(depot.id);
+            if (clusterCustomers == null || clusterCustomers.isEmpty()) {
+                continue;
+            }
+
+            /*
+             * Paper Stage 2 starts the first route from the nearest customer in
+             * the depot cluster. The remaining customers keep chromosome order so
+             * exchange, insertion, and 2-opt still perturb the decoded solution.
+             */
+            int nearestPos = 0;
+            double nearestDistance = Double.POSITIVE_INFINITY;
+            for (int i = 0; i < clusterCustomers.size(); i++) {
+                double dist = DataLoader.distance(depot.id, clusterCustomers.get(i));
+                if (dist < nearestDistance) {
+                    nearestDistance = dist;
+                    nearestPos = i;
+                }
+            }
+            if (nearestPos > 0) {
+                Integer nearest = clusterCustomers.remove(nearestPos);
+                clusterCustomers.add(0, nearest);
+            }
+
+            EVRoute current = null;
+            for (int cid : clusterCustomers) {
+                if (current == null) {
+                    current = new EVRoute(nextEvId++, depot.id);
+                    current.customerIds.add(cid);
+                    rebuildRoute(current, current.startDepotId, current.startDepotId);
+                    routes.add(current);
+                    continue;
+                }
+
+                int pos = bestPaperRouteInsertionPosition(current, cid);
+                if (pos >= 0) {
+                    current.customerIds.add(pos, cid);
+                    rebuildRoute(current, current.startDepotId, current.startDepotId);
+                } else {
+                    current = new EVRoute(nextEvId++, depot.id);
+                    current.customerIds.add(cid);
+                    rebuildRoute(current, current.startDepotId, current.startDepotId);
+                    routes.add(current);
+                }
+            }
+        }
+
+        return routes;
+    }
+
+    private static int bestPaperRouteInsertionPosition(EVRoute route, int cid) {
+        int bestPosition = -1;
+        double bestCostIncrease = Double.POSITIVE_INFINITY;
+
+        for (int pos = 0; pos <= route.customerIds.size(); pos++) {
+            EVRoute test = new EVRoute(route);
+            test.customerIds.add(pos, cid);
+            rebuildRoute(test, test.startDepotId, test.startDepotId);
+
+            if (!routeLevelFeasible(test)) {
+                continue;
+            }
+
+            double delta = test.energyUsed - route.energyUsed;
+            if (delta < bestCostIncrease) {
+                bestCostIncrease = delta;
+                bestPosition = pos;
+            }
+        }
+
+        return bestPosition;
     }
 
     private static Insertion findBestInsertion(List<EVRoute> routes, int cid) {
@@ -391,6 +517,59 @@ public class Decoder {
             rebuildRoute(route, route.startDepotId, endDepotId);
         }
     }
+
+    private static void assignPaperClosestEndDepots(Solution sol) {
+        if (sol.evRoutes.isEmpty()) return;
+
+        Map<Integer, Integer> remainingEndQuota = new LinkedHashMap<>();
+        for (Node depot : DataLoader.depots) {
+            remainingEndQuota.put(depot.id, 0);
+        }
+        for (EVRoute route : sol.evRoutes) {
+            remainingEndQuota.merge(route.startDepotId, 1, Integer::sum);
+        }
+
+        List<EVRoute> routes = new ArrayList<>(sol.evRoutes);
+        routes.sort(Comparator.comparingInt(r -> r.evId));
+
+        for (EVRoute route : routes) {
+            int lastNodeId = route.customerIds.isEmpty()
+                    ? route.startDepotId
+                    : route.customerIds.get(route.customerIds.size() - 1);
+
+            List<Node> candidates = new ArrayList<>(DataLoader.depots);
+            candidates.sort(Comparator.comparingDouble(
+                    depot -> DataLoader.distance(lastNodeId, depot.id)
+            ));
+
+            boolean assigned = false;
+            for (Node depot : candidates) {
+                if (remainingEndQuota.getOrDefault(depot.id, 0) <= 0) {
+                    continue;
+                }
+
+                EVRoute test = new EVRoute(route);
+                rebuildRoute(test, test.startDepotId, depot.id);
+                if (!routeLevelFeasible(test)) {
+                    continue;
+                }
+
+                rebuildRoute(route, route.startDepotId, depot.id);
+                remainingEndQuota.merge(depot.id, -1, Integer::sum);
+                assigned = true;
+                break;
+            }
+
+            if (!assigned) {
+                /*
+                 * Repair fallback for the ambiguous case where greedy closest-depot
+                 * assignment cannot satisfy depot balance globally.
+                 */
+                assignOpenEndDepots(sol);
+                return;
+            }
+        }
+    }
     private static void searchBestEndDepotAssignmentFast(List<EVRoute> routes,
                                                          List<Node> depots,
                                                          int index,
@@ -577,6 +756,215 @@ public class Decoder {
         computeCost(sol);
         sol.totalPenalty = ConstraintChecker.penalty(sol);
         sol.feasible = ConstraintChecker.isFeasible(sol);
+    }
+
+    private static void assignPaperCollaborativeDroneTrips(Solution sol) {
+        refreshAllRoutes(sol);
+
+        Set<Integer> alreadyDroneServed = sol.allDroneTrips.stream()
+                .map(dt -> dt.serveNodeId)
+                .collect(Collectors.toSet());
+
+        List<DroneState> droneStates = initDroneStates(sol);
+        improvePaperDepotDroneRetrieveByEV(sol, droneStates);
+
+        boolean changed = true;
+        int guard = 0;
+        int maxRounds = Math.max(1, DataLoader.customers.size());
+
+        while (changed && guard < maxRounds) {
+            changed = false;
+            guard++;
+            refreshAllRoutes(sol);
+
+            List<Integer> routeIds = sol.evRoutes.stream()
+                    .map(r -> r.evId)
+                    .collect(Collectors.toList());
+
+            for (int evId : routeIds) {
+                EVRoute evRoute = findRouteByEvId(sol, evId);
+                if (evRoute == null) continue;
+
+                int nodeIndex = 0;
+                while (true) {
+                    evRoute = findRouteByEvId(sol, evId);
+                    if (evRoute == null || nodeIndex >= evRoute.customerIds.size()) {
+                        break;
+                    }
+
+                    int currentNodeId = evRoute.customerIds.get(nodeIndex);
+                    syncCarriedDronesWithEVAtNode(droneStates, evRoute, currentNodeId);
+
+                    boolean launched;
+                    do {
+                        evRoute = findRouteByEvId(sol, evId);
+                        if (evRoute == null) {
+                            launched = false;
+                        } else {
+                            launched = launchBestPaperDroneFromEVNode(
+                                    sol,
+                                    droneStates,
+                                    evRoute,
+                                    currentNodeId,
+                                    nodeIndex,
+                                    alreadyDroneServed
+                            );
+                        }
+
+                        if (launched) {
+                            changed = true;
+                            refreshAllRoutes(sol);
+                            evRoute = findRouteByEvId(sol, evId);
+                            if (evRoute != null && evRoute.customerIds.contains(currentNodeId)) {
+                                syncCarriedDronesWithEVAtNode(droneStates, evRoute, currentNodeId);
+                            }
+                        }
+                    } while (launched);
+
+                    nodeIndex++;
+                }
+            }
+        }
+
+        pruneEmptyRoutes(sol);
+        assignPaperClosestEndDepots(sol);
+        refreshAllRoutes(sol);
+        computeCost(sol);
+        sol.totalPenalty = ConstraintChecker.penalty(sol);
+        sol.feasible = ConstraintChecker.isFeasible(sol);
+    }
+
+    private static boolean launchBestPaperDroneFromEVNode(Solution sol,
+                                                          List<DroneState> droneStates,
+                                                          EVRoute evRoute,
+                                                          int launchNodeId,
+                                                          int launchIndex,
+                                                          Set<Integer> alreadyDroneServed) {
+        if (evRoute.launchCountAtNode(launchNodeId) >= 2) {
+            return false;
+        }
+
+        List<DroneState> availableStates = new ArrayList<>();
+        for (DroneState state : droneStates) {
+            if (state.ownerEVId == evRoute.evId && state.currentNodeId == launchNodeId) {
+                availableStates.add(state);
+            }
+        }
+
+        if (availableStates.isEmpty()) {
+            return false;
+        }
+
+        Stage3SearchContext ctx = new Stage3SearchContext(sol, alreadyDroneServed);
+        List<Integer> candidateServe = candidateDroneCustomersPaper(ctx);
+        if (candidateServe.isEmpty()) {
+            return false;
+        }
+
+        DroneMove best = null;
+        DroneState bestState = null;
+        for (DroneState state : availableStates) {
+            DroneMove move = findBestPaperSequentialDroneMove(
+                    sol,
+                    evRoute,
+                    state,
+                    launchNodeId,
+                    launchIndex,
+                    ctx,
+                    candidateServe
+            );
+
+            if (move != null && (best == null || move.objectiveAfter < best.objectiveAfter)) {
+                best = move;
+                bestState = state;
+            }
+        }
+
+        if (best == null) {
+            return false;
+        }
+
+        return applySequentialDroneMoveSafely(sol, bestState, best, alreadyDroneServed);
+    }
+
+    private static DroneMove findBestPaperSequentialDroneMove(Solution sol,
+                                                              EVRoute launchRoute,
+                                                              DroneState state,
+                                                              int launchNodeId,
+                                                              int launchIndex,
+                                                              Stage3SearchContext ctx,
+                                                              List<Integer> candidateServe) {
+        DroneMove best = null;
+
+        for (int serveId : candidateServe) {
+            EVRoute servedRoute = ctx.routeByCustomer.get(serveId);
+            if (servedRoute == null) continue;
+
+            for (int retrieveNodeId : candidateRetrieveNodesAfterLaunchPaper(launchRoute, launchIndex)) {
+                DroneMove move = buildDroneMoveIfFeasible(
+                        sol, launchRoute, servedRoute, launchRoute, state,
+                        launchNodeId, serveId, retrieveNodeId, ctx
+                );
+                if (move != null && evaluateMoveObjective(sol, move, ctx)
+                        && (best == null || move.objectiveAfter < best.objectiveAfter)) {
+                    best = move;
+                }
+            }
+
+            for (EVRoute retrieveRoute : sol.evRoutes) {
+                if (retrieveRoute.evId == launchRoute.evId) continue;
+
+                for (int retrieveNodeId : candidateRetrieveNodesOnRoutePaper(retrieveRoute)) {
+                    DroneMove move = buildDroneMoveIfFeasible(
+                            sol, launchRoute, servedRoute, retrieveRoute, state,
+                            launchNodeId, serveId, retrieveNodeId, ctx
+                    );
+                    if (move != null && evaluateMoveObjective(sol, move, ctx)
+                            && (best == null || move.objectiveAfter < best.objectiveAfter)) {
+                        best = move;
+                    }
+                }
+            }
+
+            for (Node depot : DataLoader.depots) {
+                DroneMove move = buildDroneMoveIfFeasible(
+                        sol, launchRoute, servedRoute, null, state,
+                        launchNodeId, serveId, depot.id, ctx
+                );
+                if (move != null && evaluateMoveObjective(sol, move, ctx)
+                        && (best == null || move.objectiveAfter < best.objectiveAfter)) {
+                    best = move;
+                }
+            }
+        }
+
+        return best;
+    }
+
+    private static List<Integer> candidateDroneCustomersPaper(Stage3SearchContext ctx) {
+        List<Integer> out = new ArrayList<>();
+        for (int cid : ctx.directCustomersInRouteOrder) {
+            if (ctx.droneServedCustomers.contains(cid)) continue;
+            if (!DataLoader.isDroneEligibleCustomer(cid)) continue;
+            if (ctx.droneOperationNodes.contains(cid)) continue;
+            out.add(cid);
+        }
+        return out;
+    }
+
+    private static List<Integer> candidateRetrieveNodesAfterLaunchPaper(EVRoute route,
+                                                                        int launchIndex) {
+        if (launchIndex + 1 >= route.customerIds.size()) {
+            return Collections.emptyList();
+        }
+        return new ArrayList<>(route.customerIds.subList(
+                launchIndex + 1,
+                route.customerIds.size()
+        ));
+    }
+
+    private static List<Integer> candidateRetrieveNodesOnRoutePaper(EVRoute route) {
+        return new ArrayList<>(route.customerIds);
     }
 
     private static List<DroneState> initDroneStates(Solution sol) {
@@ -950,8 +1338,9 @@ public class Decoder {
         move.arriveTime = rawArrive + hover;
         move.hoverTime = hover;
         move.energyUsed = energy;
+
         // savingScore không còn dùng để chọn move.
-// Stage 3 chọn theo objectiveAfter trong evaluateMoveObjective().
+        // Stage 3 chọn theo objectiveAfter trong evaluateMoveObjective().
         move.savingScore = 0.0;
         move.droneId = state.droneId;
         move.tripIndex = state.nextTripIndex;
@@ -1234,8 +1623,8 @@ public class Decoder {
     }
 
     private static boolean evaluateMoveObjective(Solution sol,
-                                                 DroneMove move,
-                                                 Stage3SearchContext ctx) {
+                                                  DroneMove move,
+                                                  Stage3SearchContext ctx) {
         EVRoute launchRoute = move.launchRoute;
         EVRoute servedRoute = move.servedRoute;
         EVRoute retrieveRoute = move.retrieveRoute;
@@ -1352,6 +1741,211 @@ public class Decoder {
 
         move.objectiveAfter = objective;
         return true;
+    }
+
+    private static void improvePaperDepotDroneRetrieveByEV(Solution sol,
+                                                           List<DroneState> droneStates) {
+        refreshAllRoutes(sol);
+
+        Set<Integer> droneServedCustomers = new HashSet<>();
+        for (DroneTrip dt : sol.allDroneTrips) {
+            droneServedCustomers.add(dt.serveNodeId);
+        }
+
+        for (DroneTrip trip : new ArrayList<>(sol.allDroneTrips)) {
+            if (trip.launchEVId > 0 || trip.retrieveEVId > 0) continue;
+
+            double d1 = DataLoader.distance(trip.launchNodeId, trip.serveNodeId);
+            DroneTrip bestCandidate = null;
+            EVRoute bestRetrieveRoute = null;
+            double bestEnergy = trip.energyUsed;
+
+            for (EVRoute route : sol.evRoutes) {
+                for (int retrieveNodeId : route.customerIds) {
+                    if (route.retrieveCountAtNode(retrieveNodeId) >= 1) continue;
+                    if (droneServedCustomers.contains(retrieveNodeId)) continue;
+
+                    double d2 = DataLoader.distance(trip.serveNodeId, retrieveNodeId);
+                    if (!EnergyUtil.droneHasEnoughEnergy(d1, d2)) continue;
+
+                    double rawArrive = trip.departTime
+                            + TimeUtil.droneTravelTime(d1 + d2)
+                            + 4.0 * Constants.DRONE_T1;
+
+                    double evArrivalAtRetrieve = route.getArrivalAtNode(retrieveNodeId);
+                    double evDepartAtRetrieve = route.getDepartureAtNode(retrieveNodeId);
+                    if (rawArrive > evDepartAtRetrieve + 1e-9) continue;
+
+                    double hover = Math.max(0.0, evArrivalAtRetrieve - rawArrive);
+                    double energy = EnergyUtil.droneEnergy(d1, d2, hover);
+                    if (energy >= bestEnergy - 1e-9) continue;
+
+                    DroneTrip candidate = new DroneTrip(trip);
+                    candidate.retrieveNodeId = retrieveNodeId;
+                    candidate.retrieveEVId = route.evId;
+                    candidate.arriveTime = rawArrive + hover;
+                    candidate.hoverTime = hover;
+                    candidate.energyUsed = energy;
+
+                    bestEnergy = energy;
+                    bestCandidate = candidate;
+                    bestRetrieveRoute = route;
+                }
+            }
+
+            if (bestCandidate == null || bestRetrieveRoute == null) {
+                continue;
+            }
+
+            Solution beforeCommit = new Solution(sol);
+            List<DroneState> beforeStates = copyDroneStates(droneStates);
+
+            trip.retrieveNodeId = bestCandidate.retrieveNodeId;
+            trip.retrieveEVId = bestCandidate.retrieveEVId;
+            trip.arriveTime = bestCandidate.arriveTime;
+            trip.hoverTime = bestCandidate.hoverTime;
+            trip.energyUsed = bestCandidate.energyUsed;
+
+            if (!bestRetrieveRoute.droneTrips.contains(trip)) {
+                bestRetrieveRoute.droneTrips.add(trip);
+            }
+
+            refreshAllRoutes(sol);
+            computeCost(sol);
+            sol.totalPenalty = ConstraintChecker.penalty(sol);
+            sol.feasible = ConstraintChecker.isFeasible(sol);
+
+            if (!sol.feasible) {
+                restoreSolution(sol, beforeCommit);
+                droneStates.clear();
+                droneStates.addAll(beforeStates);
+                continue;
+            }
+
+            for (DroneState state : droneStates) {
+                if (state.droneId == trip.droneId) {
+                    state.currentNodeId = trip.retrieveNodeId;
+                    state.ownerEVId = trip.retrieveEVId;
+                    state.availableTime = trip.arriveTime;
+                    state.nextTripIndex = Math.max(state.nextTripIndex, trip.tripIndex + 1);
+                }
+            }
+        }
+    }
+
+    private static void repairPaperSolution(Solution sol) {
+        List<Integer> customersToReinsert = new ArrayList<>();
+
+        for (DroneTrip dt : new ArrayList<>(sol.allDroneTrips)) {
+            if (!droneTripFeasibleInSolution(sol, dt)) {
+                customersToReinsert.add(dt.serveNodeId);
+                removeDroneTrip(sol, dt);
+            }
+        }
+
+        for (int cid : customersToReinsert) {
+            insertCustomerMinimumCost(sol, cid);
+        }
+
+        pruneEmptyRoutes(sol);
+        assignPaperClosestEndDepots(sol);
+        refreshAllRoutes(sol);
+        computeCost(sol);
+        sol.totalPenalty = ConstraintChecker.penalty(sol);
+        sol.feasible = ConstraintChecker.isFeasible(sol);
+
+        if (sol.feasible) {
+            return;
+        }
+
+        customersToReinsert.clear();
+        for (DroneTrip dt : new ArrayList<>(sol.allDroneTrips)) {
+            customersToReinsert.add(dt.serveNodeId);
+            removeDroneTrip(sol, dt);
+        }
+
+        for (int cid : customersToReinsert) {
+            insertCustomerMinimumCost(sol, cid);
+        }
+
+        pruneEmptyRoutes(sol);
+        assignPaperClosestEndDepots(sol);
+        refreshAllRoutes(sol);
+        computeCost(sol);
+        sol.totalPenalty = ConstraintChecker.penalty(sol);
+        sol.feasible = ConstraintChecker.isFeasible(sol);
+    }
+
+    private static boolean droneTripFeasibleInSolution(Solution sol, DroneTrip dt) {
+        if (!singleDroneTripBasicFeasible(dt)) {
+            return false;
+        }
+
+        if (dt.launchEVId > 0) {
+            EVRoute launchRoute = findRouteByEvId(sol, dt.launchEVId);
+            if (launchRoute == null || !launchRoute.visitsNode(dt.launchNodeId)) {
+                return false;
+            }
+        }
+
+        if (dt.retrieveEVId > 0) {
+            EVRoute retrieveRoute = findRouteByEvId(sol, dt.retrieveEVId);
+            if (retrieveRoute == null || !retrieveRoute.visitsNode(dt.retrieveNodeId)) {
+                return false;
+            }
+            if (dt.arriveTime > retrieveRoute.getDepartureAtNode(dt.retrieveNodeId) + 1e-9) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static void removeDroneTrip(Solution sol, DroneTrip trip) {
+        sol.allDroneTrips.remove(trip);
+        for (EVRoute route : sol.evRoutes) {
+            route.droneTrips.remove(trip);
+        }
+    }
+
+    private static void insertCustomerMinimumCost(Solution sol, int cid) {
+        EVRoute bestRoute = null;
+        int bestPosition = -1;
+        double bestDelta = Double.POSITIVE_INFINITY;
+
+        for (EVRoute route : sol.evRoutes) {
+            if (route.customerIds.contains(cid)) {
+                return;
+            }
+            for (int pos = 0; pos <= route.customerIds.size(); pos++) {
+                EVRoute test = new EVRoute(route);
+                test.customerIds.add(pos, cid);
+                rebuildRoute(test, test.startDepotId, test.endDepotId);
+                if (!routeLevelFeasible(test)) continue;
+
+                double delta = test.energyUsed - route.energyUsed;
+                if (delta < bestDelta) {
+                    bestDelta = delta;
+                    bestRoute = route;
+                    bestPosition = pos;
+                }
+            }
+        }
+
+        if (bestRoute != null) {
+            bestRoute.customerIds.add(bestPosition, cid);
+            rebuildRoute(bestRoute, bestRoute.startDepotId, bestRoute.endDepotId);
+            return;
+        }
+
+        int nextEvId = sol.evRoutes.stream()
+                .mapToInt(r -> r.evId)
+                .max()
+                .orElse(0) + 1;
+        EVRoute route = new EVRoute(nextEvId, bestStartDepotForCustomer(cid));
+        route.customerIds.add(cid);
+        rebuildRoute(route, route.startDepotId, route.startDepotId);
+        sol.evRoutes.add(route);
     }
     private static void improveDepotDroneRetrieveByEV(Solution sol,
                                                       List<DroneState> droneStates) {

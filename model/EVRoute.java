@@ -21,7 +21,7 @@ public class EVRoute {
     public int endDepotId;
     public List<Integer> customerIds;
 
-    // ⚠️ CHỈ LƯU REFERENCE, KHÔNG COPY
+
     public List<DroneTrip> droneTrips;
 
     public List<Double> arrivalTimes;
