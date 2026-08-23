@@ -104,7 +104,9 @@ public class DataLoader {
             int id = Integer.parseInt(p[0]);
             double x = Double.parseDouble(p[1]);
             double y = Double.parseDouble(p[2]);
-            double demand = normalizeDemandForPaperBenchmark(Double.parseDouble(p[4]));
+            // Never change input data based on an instance name.  The paper's
+            // dataset construction is a preprocessing concern, not solver logic.
+            double demand = Double.parseDouble(p[4]);
 
             Node customer = new Node(id, x, y, demand, false);
             customer.readyTime = Constants.T_START;
@@ -133,7 +135,9 @@ public class DataLoader {
             nodeMap.put(depot.id, depot);
         }
 
-        numDrone = Math.max(numDepots * Constants.MAX_DEPOT_DRONES_PER_DEPOT, numEV * numDepots);
+        // The paper assumes that a sufficient number of drones is available.  This
+        // diagnostic field is intentionally not used as a solver-side fleet cap.
+        numDrone = 0;
         List<Node> all = new ArrayList<>();
         all.addAll(customers);
         all.addAll(depots);
@@ -160,32 +164,9 @@ public class DataLoader {
         System.out.println("Customers   : " + customers.size());
         System.out.println("Depots      : " + depots.size());
         System.out.println("EVs/depot   : " + numEV);
-        System.out.println("Drone pool  : " + numDrone + " (heuristic upper bound)");
+        System.out.println("Drone pool  : sufficient (paper assumption; no hard cap)");
         System.out.println("Drone-able  : " + droneEligible + " / " + customers.size());
         System.out.println("===================");
-    }
-    private static double normalizeDemandForPaperBenchmark(double rawDemand) {
-        String name = instanceName == null ? "" : instanceName.toLowerCase(Locale.ROOT);
-
-        /*
-         * Paper tạo p01-p15 từ p02/p04 và có chỉnh demand.
-         * Nếu dữ liệu đầu vào của anh đã chỉnh sẵn thì KHÔNG gọi hàm này.
-         */
-        boolean paperInstance = Constants.NORMALIZE_PAPER_DEMAND && name.matches("p\\d+");
-
-        if (!paperInstance) {
-            return rawDemand;
-        }
-
-        if (rawDemand >= 11.0 && rawDemand <= 15.0) {
-            return rawDemand - 10.0;
-        }
-
-        if (rawDemand >= 16.0 && rawDemand <= 19.0) {
-            return rawDemand - 15.0;
-        }
-
-        return rawDemand;
     }
     public static double distance(int id1, int id2) {
         Integer i = nodeIndex.get(id1);

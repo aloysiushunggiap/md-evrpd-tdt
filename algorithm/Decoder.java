@@ -17,31 +17,10 @@ public class Decoder {
     }
 
     public static Solution decode(List<Integer> chromosome) {
-        Solution sol = new Solution();
-
-        // ===== Stage 1: Depot-centric clustering & depot-drone assignment =====
-        Set<Integer> servedByDepotDrone = assignDepotDrones(sol, chromosome);
-
-        // ===== Stage 2: Global EV route construction =====
-        List<Integer> remainingCustomers = new ArrayList<>();
-
-        for (int cid : chromosome) {
-            if (!servedByDepotDrone.contains(cid)) {
-                remainingCustomers.add(cid);
-            }
-        }
-
-        sol.evRoutes.addAll(buildGlobalEVRoutes(remainingCustomers));
-
-        pruneEmptyRoutes(sol);
-        assignOpenEndDepots(sol);
-        refreshAllRoutes(sol);
-
-        // ===== Stage 3: Collaborative Drone-EV Integration =====
-        // Hàm này đã tự prune/open-depot/refresh/computeCost/check feasible ở cuối.
-        assignCollaborativeDroneTrips(sol);
-
-        return sol;
+        // Keep the historical public entry point, but route all callers through the
+        // paper three-stage decoder.  The former global-route decoder is retained
+        // only as private reference code and is never a production solver path.
+        return decodePaperICGA(chromosome);
     }
 
     public static Solution decodePaperICGA(List<Integer> chromosome) {
@@ -236,66 +215,58 @@ public class Decoder {
     private static List<EVRoute> buildPaperEVRoutes(List<Integer> chromosome,
                                                     Set<Integer> servedByDepotDrone) {
         List<EVRoute> routes = new ArrayList<>();
-        Map<Integer, List<Integer>> clusters = new LinkedHashMap<>();
+        int nextEvId = 1;
 
+        // Stage 2 in Section 6.1.2 is depot-centric: retain chromosome order
+        // inside a cluster, but start each cluster from its nearest customer.
+        Map<Integer, List<Integer>> clusters = new LinkedHashMap<>();
         List<Node> depots = new ArrayList<>(DataLoader.depots);
         depots.sort(Comparator.comparingInt(d -> d.id));
-        for (Node depot : depots) {
-            clusters.put(depot.id, new ArrayList<>());
-        }
-
+        for (Node depot : depots) clusters.put(depot.id, new ArrayList<>());
         for (int cid : chromosome) {
-            if (servedByDepotDrone.contains(cid)) {
-                continue;
-            }
-            Node depot = nearestDepot(DataLoader.getCustomer(cid));
-            clusters.get(depot.id).add(cid);
+            if (servedByDepotDrone.contains(cid)) continue;
+            clusters.get(nearestDepot(DataLoader.getCustomer(cid)).id).add(cid);
         }
 
-        int nextEvId = 1;
         for (Node depot : depots) {
-            List<Integer> clusterCustomers = clusters.get(depot.id);
-            if (clusterCustomers == null || clusterCustomers.isEmpty()) {
-                continue;
-            }
+            List<Integer> customers = clusters.get(depot.id);
+            if (customers == null || customers.isEmpty()) continue;
 
-            /*
-             * Paper Stage 2 starts the first route from the nearest customer in
-             * the depot cluster. The remaining customers keep chromosome order so
-             * exchange, insertion, and 2-opt still perturb the decoded solution.
-             */
-            int nearestPos = 0;
+            int nearestIndex = 0;
             double nearestDistance = Double.POSITIVE_INFINITY;
-            for (int i = 0; i < clusterCustomers.size(); i++) {
-                double dist = DataLoader.distance(depot.id, clusterCustomers.get(i));
-                if (dist < nearestDistance) {
-                    nearestDistance = dist;
-                    nearestPos = i;
+            for (int i = 0; i < customers.size(); i++) {
+                double distance = DataLoader.distance(depot.id, customers.get(i));
+                if (distance < nearestDistance) {
+                    nearestDistance = distance;
+                    nearestIndex = i;
                 }
             }
-            if (nearestPos > 0) {
-                Integer nearest = clusterCustomers.remove(nearestPos);
-                clusterCustomers.add(0, nearest);
+            if (nearestIndex != 0) {
+                Integer nearest = customers.remove(nearestIndex);
+                customers.add(0, nearest);
             }
 
             EVRoute current = null;
-            for (int cid : clusterCustomers) {
+            for (int cid : customers) {
                 if (current == null) {
                     current = new EVRoute(nextEvId++, depot.id);
                     current.customerIds.add(cid);
-                    rebuildRoute(current, current.startDepotId, current.startDepotId);
+                    rebuildRouteWithBestTemporaryEndDepot(current);
                     routes.add(current);
                     continue;
                 }
 
-                int pos = bestPaperRouteInsertionPosition(current, cid);
-                if (pos >= 0) {
-                    current.customerIds.add(pos, cid);
-                    rebuildRoute(current, current.startDepotId, current.startDepotId);
+                EVRoute appended = new EVRoute(current);
+                appended.customerIds.add(cid);
+                if (rebuildRouteWithBestTemporaryEndDepot(appended)) {
+                    current.customerIds.add(cid);
+                    rebuildRoute(current, current.startDepotId, appended.endDepotId);
                 } else {
+                    // Virtual depot 0: terminate this route and dispatch a new
+                    // EV from the cluster depot before the next chromosome gene.
                     current = new EVRoute(nextEvId++, depot.id);
                     current.customerIds.add(cid);
-                    rebuildRoute(current, current.startDepotId, current.startDepotId);
+                    rebuildRouteWithBestTemporaryEndDepot(current);
                     routes.add(current);
                 }
             }
@@ -304,27 +275,33 @@ public class Decoder {
         return routes;
     }
 
-    private static int bestPaperRouteInsertionPosition(EVRoute route, int cid) {
-        int bestPosition = -1;
-        double bestCostIncrease = Double.POSITIVE_INFINITY;
+    /**
+     * During the route-splitting pass the final open return-depot assignment is not
+     * known yet.  Use the feasible depot requiring the least EV energy as a temporary
+     * end, then let assignPaperClosestEndDepots enforce the paper's depot balance.
+     */
+    private static boolean rebuildRouteWithBestTemporaryEndDepot(EVRoute route) {
+        EVRoute best = null;
 
-        for (int pos = 0; pos <= route.customerIds.size(); pos++) {
+        for (Node depot : DataLoader.depots) {
             EVRoute test = new EVRoute(route);
-            test.customerIds.add(pos, cid);
-            rebuildRoute(test, test.startDepotId, test.startDepotId);
+            rebuildRoute(test, test.startDepotId, depot.id);
 
             if (!routeLevelFeasible(test)) {
                 continue;
             }
 
-            double delta = test.energyUsed - route.energyUsed;
-            if (delta < bestCostIncrease) {
-                bestCostIncrease = delta;
-                bestPosition = pos;
+            if (best == null || test.energyUsed < best.energyUsed) {
+                best = test;
             }
         }
 
-        return bestPosition;
+        if (best == null) {
+            return false;
+        }
+
+        rebuildRoute(route, route.startDepotId, best.endDepotId);
+        return true;
     }
 
     private static Insertion findBestInsertion(List<EVRoute> routes, int cid) {
@@ -760,6 +737,8 @@ public class Decoder {
 
     private static void assignPaperCollaborativeDroneTrips(Solution sol) {
         refreshAllRoutes(sol);
+        // Stage 3 evaluates every candidate against the current objective.
+        computeCost(sol);
 
         Set<Integer> alreadyDroneServed = sol.allDroneTrips.stream()
                 .map(dt -> dt.serveNodeId)
@@ -1426,9 +1405,7 @@ public class Decoder {
     // Route rebuild / refresh / cost
     // ==========================================================
     private static void refreshAllRoutes(Solution sol) {
-        for (EVRoute route : sol.evRoutes) {
-            rebuildRoute(route, route.startDepotId, route.endDepotId);
-        }
+        ScheduleEvaluator.evaluate(sol);
     }
 
     private static void rebuildRoute(EVRoute route, int startDepotId, int endDepotId) {
@@ -1509,23 +1486,7 @@ public class Decoder {
     }
 
     private static void computeCost(Solution sol) {
-        double cost = 0.0;
-
-        cost += sol.evRoutes.size() * Constants.EV_DISPATCH_COST;
-
-        for (EVRoute route : sol.evRoutes) {
-            cost += route.energyUsed * Constants.ELECTRICITY_PRICE;
-        }
-
-        Set<Integer> usedDroneIds = new HashSet<>();
-        for (DroneTrip dt : sol.allDroneTrips) {
-            cost += dt.energyUsed * Constants.ELECTRICITY_PRICE;
-            usedDroneIds.add(dt.droneId);
-        }
-
-        cost += usedDroneIds.size() * Constants.DRONE_DISPATCH_COST;
-
-        sol.totalCost = cost;
+        ScheduleEvaluator.evaluate(sol);
     }
 
     private static void pruneEmptyRoutes(Solution sol) {
@@ -1740,7 +1701,13 @@ public class Decoder {
         }
 
         move.objectiveAfter = objective;
-        return true;
+
+        /*
+         * The paper minimizes objective (1).  Feasibility alone is not enough:
+         * a best candidate can still be worse than keeping the current EV
+         * service.  Accept only a strict cost improvement.
+         */
+        return objective + 1e-9 < sol.totalCost;
     }
 
     private static void improvePaperDepotDroneRetrieveByEV(Solution sol,

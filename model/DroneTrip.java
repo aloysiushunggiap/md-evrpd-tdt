@@ -21,8 +21,18 @@ public class DroneTrip {
     public int retrieveEVId;  // -1 nếu về depot
 
     public double departTime;
+    /** Physical flight arrival required by Eq.(30)-(31). */
+    public double flightArrivalTime;
+    /** Completion of rendezvous after any necessary hover/wait. */
+    public double rendezvousTime;
+    /** Alias retained for compatibility: this is rendezvous completion. */
     public double arriveTime;
     public double hoverTime;
+    public double availableAfterServiceTime;
+
+    /** Explicit lifecycle endpoints used for depot-balance constraints. */
+    public int dispatchDepotId;
+    public int returnDepotId;
 
     public double energyUsed;
 
@@ -45,8 +55,13 @@ public class DroneTrip {
         this.retrieveEVId = retrieveEVId;
 
         this.departTime = 0.0;
+        this.flightArrivalTime = 0.0;
+        this.rendezvousTime = 0.0;
         this.arriveTime = 0.0;
         this.hoverTime = 0.0;
+        this.availableAfterServiceTime = 0.0;
+        this.dispatchDepotId = -1;
+        this.returnDepotId = -1;
         this.energyUsed = 0.0;
     }
 
@@ -65,8 +80,13 @@ public class DroneTrip {
         this.retrieveEVId = other.retrieveEVId;
 
         this.departTime = other.departTime;
+        this.flightArrivalTime = other.flightArrivalTime;
+        this.rendezvousTime = other.rendezvousTime;
         this.arriveTime = other.arriveTime;
         this.hoverTime = other.hoverTime;
+        this.availableAfterServiceTime = other.availableAfterServiceTime;
+        this.dispatchDepotId = other.dispatchDepotId;
+        this.returnDepotId = other.returnDepotId;
         this.energyUsed = other.energyUsed;
     }
 

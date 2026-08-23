@@ -42,7 +42,26 @@ public class TimeUtil {
                 + 0.56) * t
                 + 52.3);
 
-        return Math.max(v, 5.0);
+        return v;
+    }
+
+    /** Derivative of Eq.(48), in (km/h) per hour. */
+    public static double speedDerivative(double t) {
+        return -1.40e-18 * Math.pow(t, 9)
+                + 1.899e-15 * Math.pow(t, 8)
+                - 1.08e-12 * Math.pow(t, 7)
+                + 3.346e-10 * Math.pow(t, 6)
+                - 6.06e-8 * Math.pow(t, 5)
+                + 6.50e-6 * Math.pow(t, 4)
+                - 3.89652e-4 * Math.pow(t, 3)
+                + 0.012 * Math.pow(t, 2)
+                - 0.14 * t
+                + 0.56;
+    }
+
+    /** Acceleration implied by Eq.(48), converted to m/s2. */
+    public static double accelerationMetersPerSecondSquared(double t) {
+        return speedDerivative(t) * 1000.0 / (3600.0 * 3600.0);
     }
 
     /**
@@ -106,25 +125,34 @@ public class TimeUtil {
         }
 
         double v0 = speed(departTime);
-        double T = Math.max(distance / v0, distance / 120.0);
+        if (v0 <= 0.0) {
+            throw new IllegalArgumentException("Eq.(48) yields non-positive speed at t=" + departTime);
+        }
 
-        for (int iter = 0; iter < 12; iter++) {
-            double traveled = integrateSpeed(departTime, T, 0);
-            double error = traveled - distance;
-
-            if (Math.abs(error) < 1e-7) {
-                break;
-            }
-
-            double vEnd = speed(departTime + T);
-            T -= error / Math.max(vEnd, 1.0);
-
-            if (T < distance / 200.0) {
-                T = distance / 200.0;
+        double low = 0.0;
+        double high = Math.max(distance / v0 * 1.25, 1.0 / 60.0);
+        while (integrateSpeed(departTime, high, 0) < distance) {
+            high *= 2.0;
+            if (high > 48.0) {
+                throw new IllegalArgumentException("Could not bracket Eq.(49) travel time");
             }
         }
 
-        return Math.max(T, distance / 200.0);
+        double t = Math.min(high, Math.max(low, distance / v0));
+        for (int iter = 0; iter < 60; iter++) {
+            double error = integrateSpeed(departTime, t, 0) - distance;
+            if (Math.abs(error) <= 1e-9) return t;
+            if (error > 0.0) high = t; else low = t;
+
+            double derivative = speed(departTime + t);
+            double newton = derivative > 0.0 ? t - error / derivative : Double.NaN;
+            if (Double.isNaN(newton) || newton <= low || newton >= high) {
+                t = (low + high) / 2.0;
+            } else {
+                t = newton;
+            }
+        }
+        return (low + high) / 2.0;
     }
 
     /**

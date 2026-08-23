@@ -5,593 +5,289 @@ import model.EVRoute;
 import model.Node;
 import model.Solution;
 import util.DataLoader;
+import util.TimeUtil;
 
 import java.util.*;
 
 /**
- * Kiểm tra ràng buộc cho MD-EVRPD-TDT.
- *
- * Bám các nhóm constraint chính trong paper:
- * - customer served exactly once
- * - depot EV balance
- * - EV capacity / SoC / time window
- * - drone payload / SoC / time window
- * - launch/retrieve node validity
- * - launch/retrieve count at customer node
- * - synchronization at retrieve node
- * - drone trip continuity
+ * Equation-oriented feasibility checker for the paper-compliant baseline.
+ * Every public evaluation first recalculates the same schedule used by the
+ * objective, eliminating stale EV/drone timestamps.
  */
-public class ConstraintChecker {
+public final class ConstraintChecker {
+    private static final double EPS = 1e-8;
 
     private ConstraintChecker() {
     }
 
-    public static String checkAll(Solution sol) {
-        if (sol == null) return "Solution is null";
-        List<String> violations = collectViolations(sol);
+    public static String checkAll(Solution solution) {
+        List<String> violations = collectViolations(solution);
         return violations.isEmpty() ? null : violations.get(0);
     }
 
-    public static boolean isFeasible(Solution sol) {
-        return collectViolations(sol).isEmpty();
+    public static boolean isFeasible(Solution solution) {
+        return collectViolations(solution).isEmpty();
     }
 
-    /**
-     * Penalty mem de heuristic co gradient.
-     * Không thay thế ràng buộc paper, chỉ giúp heuristic phân biệt nghiệm xấu/tốt.
-     */
-    public static double penalty(Solution sol) {
-        if (sol == null) return 1e12;
-
-        double p = 0.0;
-
-        // ======================================================
-        // Eq.(8): each customer served exactly once
-        // ======================================================
-        Map<Integer, Integer> served = servedCustomerCount(sol);
-
-        for (Node c : DataLoader.customers) {
-            int count = served.getOrDefault(c.id, 0);
-            if (count == 0) {
-                p += Constants.PENALTY_MISSED_CUSTOMER;
-            } else if (count > 1) {
-                p += (count - 1) * Constants.PENALTY_DUPLICATE_CUSTOMER;
-            }
-        }
-
-        // ======================================================
-        // Eq.(2): depot EV balance
-        // ======================================================
-        Map<Integer, Integer> depotOut = new HashMap<>();
-        Map<Integer, Integer> depotIn = new HashMap<>();
-
-        for (Node d : DataLoader.depots) {
-            depotOut.put(d.id, 0);
-            depotIn.put(d.id, 0);
-        }
-
-        for (EVRoute r : sol.evRoutes) {
-            depotOut.merge(r.startDepotId, 1, Integer::sum);
-            depotIn.merge(r.endDepotId, 1, Integer::sum);
-        }
-
-        for (Node d : DataLoader.depots) {
-            int out = depotOut.getOrDefault(d.id, 0);
-            int in = depotIn.getOrDefault(d.id, 0);
-            p += Math.abs(out - in) * Constants.PENALTY_DEPOT_BALANCE;
-        }
-
-        // ======================================================
-        // EV route constraints
-        // ======================================================
-        for (EVRoute route : sol.evRoutes) {
-            // Eq.(9): EV payload includes EV customers + drone customers launched from this EV
-            double demandExcess = Math.max(0.0,
-                    route.totalDemandServedByEVAndDrone() - Constants.EV_CAPACITY);
-            p += demandExcess * Constants.PENALTY_EV_CAPACITY;
-
-            // Eq.(10): EV battery SoC
-            double maxEnergyUse = Constants.EV_BATTERY - Constants.EV_MIN_ENERGY;
-            double energyExcess = Math.max(0.0, route.energyUsed - maxEnergyUse);
-            p += energyExcess * Constants.PENALTY_EV_ENERGY;
-
-            // Eq.(6)
-            if (!route.departureTimes.isEmpty()) {
-                double departDepot = route.departureTimes.get(0);
-                if (departDepot < Constants.T_START - 1e-9) {
-                    p += (Constants.T_START - departDepot) * Constants.PENALTY_TIME;
-                }
-            }
-
-            // Eq.(7)
-            if (!route.arrivalTimes.isEmpty()) {
-                double returnTime = route.arrivalTimes.get(route.arrivalTimes.size() - 1);
-                if (returnTime > Constants.T_END + 1e-9) {
-                    p += (returnTime - Constants.T_END) * Constants.PENALTY_TIME;
-                }
-            }
-
-            // Eq.(27), Eq.(29): node launch/retrieve limits
-            Map<Integer, Integer> launchCount = launchCountByNode(route);
-            Map<Integer, Integer> retrieveCount = retrieveCountByNode(route);
-
-            for (Map.Entry<Integer, Integer> e : launchCount.entrySet()) {
-                Node node = DataLoader.getNode(e.getKey());
-
-                // At customer node: at most two launches if EV carries/retrieves drone.
-                // Conservative heuristic: absolute upper bound 2.
-                if (!node.isDepot && e.getValue() > 2) {
-                    p += (e.getValue() - 2) * Constants.PENALTY_NODE_OPERATION;
-                }
-            }
-
-            for (Map.Entry<Integer, Integer> e : retrieveCount.entrySet()) {
-                Node node = DataLoader.getNode(e.getKey());
-
-                // Eq.(27): up to one drone can be retrieved at a customer node
-                if (!node.isDepot && e.getValue() > 1) {
-                    p += (e.getValue() - 1) * Constants.PENALTY_NODE_OPERATION;
-                }
-            }
-
-            if (!routeDroneCarryFeasible(route)) {
-                p += Constants.PENALTY_NODE_OPERATION * 2.0;
-            }
-        }
-
-        // ======================================================
-        // Drone constraints
-        // ======================================================
-        for (DroneTrip dt : sol.allDroneTrips) {
-            Node servedNode = DataLoader.getCustomer(dt.serveNodeId);
-
-            // Eq.(35): payload
-            if (servedNode.demand > Constants.DRONE_CAPACITY + 1e-9) {
-                p += (servedNode.demand - Constants.DRONE_CAPACITY)
-                        * Constants.PENALTY_DRONE_ENERGY * 10.0;
-            }
-
-            // Eq.(18): drone battery SoC
-            double remain = Constants.DRONE_BATTERY - dt.energyUsed;
-            if (remain < Constants.DRONE_MIN_ENERGY - 1e-9) {
-                p += (Constants.DRONE_MIN_ENERGY - remain)
-                        * Constants.PENALTY_DRONE_ENERGY * 100.0;
-            }
-
-            // Eq.(24), Eq.(25)
-            if (dt.departTime < Constants.T_START - 1e-9) {
-                p += (Constants.T_START - dt.departTime) * Constants.PENALTY_TIME;
-            }
-
-            if (dt.arriveTime > Constants.T_END + 1e-9) {
-                p += (dt.arriveTime - Constants.T_END) * Constants.PENALTY_TIME;
-            }
-
-            // Launch EV validity
-            if (dt.launchEVId > 0) {
-                EVRoute launchRoute = findRoute(sol, dt.launchEVId);
-                if (launchRoute == null || !launchRoute.visitsNode(dt.launchNodeId)) {
-                    p += Constants.PENALTY_SYNC;
-                }
-            }
-
-            // Retrieve EV validity + Eq.(26)
-            if (dt.retrieveEVId > 0) {
-                EVRoute retrieveRoute = findRoute(sol, dt.retrieveEVId);
-                if (retrieveRoute == null || !retrieveRoute.visitsNode(dt.retrieveNodeId)) {
-                    p += Constants.PENALTY_SYNC;
-                } else {
-                    double evDepartureAtRetrieve = retrieveRoute.getDepartureAtNode(dt.retrieveNodeId);
-                    if (dt.arriveTime > evDepartureAtRetrieve + 1e-9) {
-                        p += (dt.arriveTime - evDepartureAtRetrieve) * Constants.PENALTY_SYNC;
-                    }
-                }
-            }
-        }
-
-        // ======================================================
-        // Eq.(41): drone trip continuity
-        // ======================================================
-        Map<Integer, List<DroneTrip>> byDrone = tripsByDrone(sol);
-        for (List<DroneTrip> trips : byDrone.values()) {
-            trips.sort(Comparator.comparingInt(t -> t.tripIndex));
-
-            for (int i = 1; i < trips.size(); i++) {
-                DroneTrip prev = trips.get(i - 1);
-                DroneTrip next = trips.get(i);
-
-                // time continuity
-                if (next.departTime + 1e-9 < prev.arriveTime) {
-                    p += Constants.PENALTY_CONTINUITY;
-                }
-
-                // location continuity:
-                // next launch node should be the previous retrieve node for same drone
-                if (next.launchNodeId != prev.retrieveNodeId) {
-                    p += Constants.PENALTY_CONTINUITY;
-                }
-
-                // owner continuity:
-                // if previous retrieved by EV k, next launch should be from EV k or depot only if retrieve node is depot
-                if (prev.retrieveEVId > 0) {
-                    if (next.launchEVId != prev.retrieveEVId) {
-                        p += Constants.PENALTY_CONTINUITY;
-                    }
-                } else {
-                    if (next.launchEVId > 0 && !DataLoader.getNode(prev.retrieveNodeId).isDepot) {
-                        p += Constants.PENALTY_CONTINUITY;
-                    }
-                }
-            }
-        }
-
-        return p;
+    /** Diagnostic only. ICGA uses feasibility, not a penalty surrogate. */
+    public static double penalty(Solution solution) {
+        if (solution == null) return 1e12;
+        return collectViolations(solution).size() * Constants.PENALTY_CONTINUITY;
     }
 
-    public static List<String> collectViolations(Solution sol) {
+    public static List<String> collectViolations(Solution solution) {
         List<String> out = new ArrayList<>();
-
-        if (sol == null) {
+        if (solution == null) {
             out.add("Solution is null");
             return out;
         }
+        try {
+            ScheduleEvaluator.evaluate(solution);
+        } catch (RuntimeException e) {
+            out.add("Schedule evaluation failed: " + e.getMessage());
+            return out;
+        }
 
-        // ======================================================
-        // Eq.(8): customer served exactly once
-        // ======================================================
-        Map<Integer, Integer> served = servedCustomerCount(sol);
+        Map<Integer, EVRoute> routeById = ScheduleEvaluator.routesById(solution);
+        Map<Integer, List<DroneTrip>> tripsByDrone = ScheduleEvaluator.tripsByDrone(solution);
+        Map<Integer, Integer> served = servedCustomerCount(solution);
+        Map<Integer, Integer> depotEvOut = depotCounts();
+        Map<Integer, Integer> depotEvIn = depotCounts();
+        Map<Integer, Integer> depotDroneOut = depotCounts();
+        Map<Integer, Integer> depotDroneIn = depotCounts();
+        Map<Integer, Integer> launchesAtCustomer = new HashMap<>();
+        Map<Integer, Integer> retrievesAtCustomer = new HashMap<>();
+        Set<Integer> droneServed = new HashSet<>();
 
-        for (Node c : DataLoader.customers) {
-            int count = served.getOrDefault(c.id, 0);
-            if (count == 0) {
-                out.add("Eq.8: customer " + c.id + " not served");
-            } else if (count > 1) {
-                out.add("Eq.8: customer " + c.id + " served " + count + " times");
+        Set<Integer> evIds = new HashSet<>();
+        for (EVRoute route : solution.evRoutes) {
+            if (!evIds.add(route.evId)) out.add("Eq.3: duplicate EV id " + route.evId);
+            depotEvOut.merge(route.startDepotId, 1, Integer::sum);
+            depotEvIn.merge(route.endDepotId, 1, Integer::sum);
+            validateEvRoute(solution, route, out);
+        }
+        for (Node depot : DataLoader.depots) {
+            if (!Objects.equals(depotEvOut.get(depot.id), depotEvIn.get(depot.id))) {
+                out.add("Eq.2: EV dispatch/return imbalance at depot " + depot.id);
             }
         }
 
-        // ======================================================
-        // Eq.(2): depot EV balance
-        // ======================================================
-        Map<Integer, Integer> depotOut = new HashMap<>();
-        Map<Integer, Integer> depotIn = new HashMap<>();
-
-        for (Node d : DataLoader.depots) {
-            depotOut.put(d.id, 0);
-            depotIn.put(d.id, 0);
+        for (Node customer : DataLoader.customers) {
+            int count = served.getOrDefault(customer.id, 0);
+            if (count != 1) out.add("Eq.8: customer " + customer.id + " served " + count + " times");
         }
 
-        for (EVRoute r : sol.evRoutes) {
-            depotOut.merge(r.startDepotId, 1, Integer::sum);
-            depotIn.merge(r.endDepotId, 1, Integer::sum);
-        }
-
-        for (Node d : DataLoader.depots) {
-            int outCount = depotOut.getOrDefault(d.id, 0);
-            int inCount = depotIn.getOrDefault(d.id, 0);
-
-            if (outCount != inCount) {
-                out.add("Eq.2: depot " + d.id
-                        + " EV balance violated, out=" + outCount
-                        + ", in=" + inCount);
+        for (List<DroneTrip> trips : tripsByDrone.values()) {
+            if (trips.isEmpty()) continue;
+            DroneTrip first = trips.get(0);
+            if (!DataLoader.depotMap.containsKey(first.dispatchDepotId)) {
+                out.add("Eq.40: drone " + first.droneId + " has no depot dispatch origin");
+            } else {
+                depotDroneOut.merge(first.dispatchDepotId, 1, Integer::sum);
             }
-        }
-
-        // ======================================================
-        // EV route constraints
-        // ======================================================
-        for (EVRoute route : sol.evRoutes) {
-            double totalDemand = route.totalDemandServedByEVAndDrone();
-
-            if (totalDemand > Constants.EV_CAPACITY + 1e-9) {
-                out.add(String.format(Locale.US,
-                        "Eq.9: EV%d demand %.3f > %.3f",
-                        route.evId,
-                        totalDemand,
-                        Constants.EV_CAPACITY));
+            for (int i = 0; i < trips.size(); i++) {
+                DroneTrip trip = trips.get(i);
+                validateDroneTrip(routeById, trip, droneServed, launchesAtCustomer,
+                        retrievesAtCustomer, out);
+                if (i > 0) validateContinuity(trips.get(i - 1), trip, routeById, out);
             }
-
-            double maxEnergyUse = Constants.EV_BATTERY - Constants.EV_MIN_ENERGY;
-            if (route.energyUsed > maxEnergyUse + 1e-9) {
-                out.add(String.format(Locale.US,
-                        "Eq.10: EV%d energy %.5f > %.5f",
-                        route.evId,
-                        route.energyUsed,
-                        maxEnergyUse));
-            }
-
-            if (!route.departureTimes.isEmpty()) {
-                double departDepot = route.departureTimes.get(0);
-                if (departDepot < Constants.T_START - 1e-9) {
-                    out.add(String.format(Locale.US,
-                            "Eq.6: EV%d depart %.3f < %.3f",
-                            route.evId,
-                            departDepot,
-                            Constants.T_START));
-                }
-            }
-
-            if (!route.arrivalTimes.isEmpty()) {
-                double returnTime = route.arrivalTimes.get(route.arrivalTimes.size() - 1);
-                if (returnTime > Constants.T_END + 1e-9) {
-                    out.add(String.format(Locale.US,
-                            "Eq.7: EV%d return %.3f > %.3f",
-                            route.evId,
-                            returnTime,
-                            Constants.T_END));
-                }
-            }
-
-            Map<Integer, Integer> launchCount = launchCountByNode(route);
-            Map<Integer, Integer> retrieveCount = retrieveCountByNode(route);
-
-            for (Map.Entry<Integer, Integer> e : launchCount.entrySet()) {
-                Node node = DataLoader.getNode(e.getKey());
-                if (!node.isDepot && e.getValue() > 2) {
-                    out.add("Eq.29: node " + e.getKey()
-                            + " launches " + e.getValue()
-                            + " drones > 2");
-                }
-            }
-
-            for (Map.Entry<Integer, Integer> e : retrieveCount.entrySet()) {
-                Node node = DataLoader.getNode(e.getKey());
-                if (!node.isDepot && e.getValue() > 1) {
-                    out.add("Eq.27: node " + e.getKey()
-                            + " retrieves " + e.getValue()
-                            + " drones > 1");
-                }
-            }
-
-            if (!routeDroneCarryFeasible(route)) {
-                out.add("Eq.15-17: EV" + route.evId
-                        + " carries more than one drone or launches without an onboard drone");
-            }
-        }
-
-        // ======================================================
-        // Drone constraints
-        // ======================================================
-        for (DroneTrip dt : sol.allDroneTrips) {
-            Node servedNode = DataLoader.getCustomer(dt.serveNodeId);
-
-            if (servedNode.demand > Constants.DRONE_CAPACITY + 1e-9) {
-                out.add(String.format(Locale.US,
-                        "Eq.35: drone trip Drone%d.%d serves C%d demand %.3f > %.3f",
-                        dt.droneId,
-                        dt.tripIndex,
-                        dt.serveNodeId,
-                        servedNode.demand,
-                        Constants.DRONE_CAPACITY));
-            }
-
-            double remain = Constants.DRONE_BATTERY - dt.energyUsed;
-            if (remain < Constants.DRONE_MIN_ENERGY - 1e-9) {
-                out.add(String.format(Locale.US,
-                        "Eq.18: Drone%d.%d remaining %.5f < %.5f",
-                        dt.droneId,
-                        dt.tripIndex,
-                        remain,
-                        Constants.DRONE_MIN_ENERGY));
-            }
-
-            if (dt.departTime < Constants.T_START - 1e-9) {
-                out.add(String.format(Locale.US,
-                        "Eq.24: Drone%d.%d depart %.3f < %.3f",
-                        dt.droneId,
-                        dt.tripIndex,
-                        dt.departTime,
-                        Constants.T_START));
-            }
-
-            if (dt.arriveTime > Constants.T_END + 1e-9) {
-                out.add(String.format(Locale.US,
-                        "Eq.25: Drone%d.%d arrive %.3f > %.3f",
-                        dt.droneId,
-                        dt.tripIndex,
-                        dt.arriveTime,
-                        Constants.T_END));
-            }
-
-            if (dt.launchEVId > 0) {
-                EVRoute launchRoute = findRoute(sol, dt.launchEVId);
-                if (launchRoute == null) {
-                    out.add("Eq.37/39: launch EV" + dt.launchEVId + " not found");
-                } else if (!launchRoute.visitsNode(dt.launchNodeId)) {
-                    out.add("Eq.37/39: launch node " + dt.launchNodeId
-                            + " not visited by EV" + dt.launchEVId);
-                }
-            }
-
-            if (dt.retrieveEVId > 0) {
-                EVRoute retrieveRoute = findRoute(sol, dt.retrieveEVId);
-                if (retrieveRoute == null) {
-                    out.add("Eq.19-21: retrieve EV" + dt.retrieveEVId + " not found");
-                } else if (!retrieveRoute.visitsNode(dt.retrieveNodeId)) {
-                    out.add("Eq.19-21: retrieve node " + dt.retrieveNodeId
-                            + " not visited by EV" + dt.retrieveEVId);
-                } else {
-                    double evDepartureAtRetrieve = retrieveRoute.getDepartureAtNode(dt.retrieveNodeId);
-                    if (dt.arriveTime > evDepartureAtRetrieve + 1e-9) {
-                        out.add(String.format(Locale.US,
-                                "Eq.26: Drone%d.%d arrive %.3f > EV%d depart %.3f at node %d",
-                                dt.droneId,
-                                dt.tripIndex,
-                                dt.arriveTime,
-                                dt.retrieveEVId,
-                                evDepartureAtRetrieve,
-                                dt.retrieveNodeId));
-                    }
+            DroneTrip last = trips.get(trips.size() - 1);
+            if (!DataLoader.depotMap.containsKey(last.returnDepotId)) {
+                out.add("Eq.4/5: drone " + last.droneId + " does not return to a depot");
+            } else {
+                depotDroneIn.merge(last.returnDepotId, 1, Integer::sum);
+                if (finalReturnTime(last, routeById) > Constants.T_END + EPS) {
+                    out.add("Eq.25: drone " + last.droneId + " returns after depot closing");
                 }
             }
         }
-
-        // ======================================================
-        // Eq.(41): drone continuity
-        // ======================================================
-        Map<Integer, List<DroneTrip>> byDrone = tripsByDrone(sol);
-        for (Map.Entry<Integer, List<DroneTrip>> entry : byDrone.entrySet()) {
-            int droneId = entry.getKey();
-            List<DroneTrip> trips = entry.getValue();
-            trips.sort(Comparator.comparingInt(t -> t.tripIndex));
-
-            for (int i = 1; i < trips.size(); i++) {
-                DroneTrip prev = trips.get(i - 1);
-                DroneTrip next = trips.get(i);
-
-                if (next.departTime + 1e-9 < prev.arriveTime) {
-                    out.add(String.format(Locale.US,
-                            "Eq.41: Drone%d trip%d departs %.3f before trip%d arrives %.3f",
-                            droneId,
-                            next.tripIndex,
-                            next.departTime,
-                            prev.tripIndex,
-                            prev.arriveTime));
-                }
-
-                if (next.launchNodeId != prev.retrieveNodeId) {
-                    out.add("Eq.41: Drone" + droneId
-                            + " trip" + next.tripIndex
-                            + " launches at node " + next.launchNodeId
-                            + " but previous trip retrieved at node "
-                            + prev.retrieveNodeId);
-                }
-
-                if (prev.retrieveEVId > 0 && next.launchEVId != prev.retrieveEVId) {
-                    out.add("Eq.41: Drone" + droneId
-                            + " owner continuity violated: previous retrieve EV"
-                            + prev.retrieveEVId
-                            + ", next launch EV" + next.launchEVId);
-                }
+        for (Node depot : DataLoader.depots) {
+            if (!Objects.equals(depotDroneOut.get(depot.id), depotDroneIn.get(depot.id))) {
+                out.add("Eq.4: drone dispatch/return imbalance at depot " + depot.id);
             }
         }
 
+        for (Map.Entry<Integer, Integer> entry : launchesAtCustomer.entrySet()) {
+            int nodeId = entry.getKey();
+            int launches = entry.getValue();
+            int retrieves = retrievesAtCustomer.getOrDefault(nodeId, 0);
+            if (droneServed.contains(nodeId)) out.add("Eq.22: drone-served customer " + nodeId + " launches a drone");
+            if (launches > 2) out.add("Eq.29: more than two launches at customer " + nodeId);
+            if (launches == 2 && retrieves != 1 && !hasInboundDrone(routeById, nodeId)) {
+                out.add("Eq.28/29: two launches at " + nodeId + " lack a carried/retrieved drone");
+            }
+        }
+        for (Map.Entry<Integer, Integer> entry : retrievesAtCustomer.entrySet()) {
+            int nodeId = entry.getKey();
+            if (droneServed.contains(nodeId)) out.add("Eq.23: drone-served customer " + nodeId + " retrieves a drone");
+            if (entry.getValue() > 1) out.add("Eq.27: more than one retrieval at customer " + nodeId);
+        }
+        validateCarriedArcs(solution, out);
         return out;
     }
 
-    // ==========================================================
-    // Helpers
-    // ==========================================================
-
-    public static EVRoute findRoute(Solution sol, int evId) {
-        for (EVRoute r : sol.evRoutes) {
-            if (r.evId == evId) return r;
+    private static void validateEvRoute(Solution solution, EVRoute route, List<String> out) {
+        if (!DataLoader.depotMap.containsKey(route.startDepotId)
+                || !DataLoader.depotMap.containsKey(route.endDepotId)) {
+            out.add("Eq.2/3: EV" + route.evId + " uses an invalid depot");
+            return;
         }
-        return null;
-    }
-
-    private static Map<Integer, Integer> servedCustomerCount(Solution sol) {
-        Map<Integer, Integer> served = new HashMap<>();
-
-        for (Node c : DataLoader.customers) {
-            served.put(c.id, 0);
+        if (route.totalDemandServedByEVAndDrone() > Constants.EV_CAPACITY + EPS) {
+            out.add("Eq.9: EV" + route.evId + " exceeds payload capacity");
         }
+        if (route.energyUsed > Constants.EV_BATTERY - Constants.EV_MIN_ENERGY + EPS) {
+            out.add("Eq.10: EV" + route.evId + " drops below minimum SoC");
+        }
+        if (route.arrivalTimes.size() != route.customerIds.size() + 2
+                || route.departureTimes.size() != route.customerIds.size() + 1) {
+            out.add("Eq.11/12: EV" + route.evId + " has inconsistent timing vectors");
+            return;
+        }
+        if (route.departureTimes.get(0) + EPS < Constants.T_START) out.add("Eq.6: EV leaves before Ts");
+        if (route.arrivalTimes.get(route.arrivalTimes.size() - 1) > Constants.T_END + EPS) out.add("Eq.7: EV returns after Tf");
 
-        for (EVRoute r : sol.evRoutes) {
-            for (int cid : r.customerIds) {
-                served.merge(cid, 1, Integer::sum);
+        List<Integer> nodes = new ArrayList<>();
+        nodes.add(route.startDepotId);
+        nodes.addAll(route.customerIds);
+        nodes.add(route.endDepotId);
+        Set<Integer> localCustomers = new HashSet<>();
+        for (int i = 0; i < route.customerIds.size(); i++) {
+            int customerId = route.customerIds.get(i);
+            if (!localCustomers.add(customerId)) out.add("Eq.14: EV visits customer twice");
+            double expectedArrival = route.departureTimes.get(i) + TimeUtil.travelTime(
+                    route.departureTimes.get(i),
+                    DataLoader.distance(nodes.get(i), nodes.get(i + 1)) * Constants.DETOUR_COEFF);
+            if (Math.abs(expectedArrival - route.arrivalTimes.get(i + 1)) > 1e-6) {
+                out.add("Eq.11/12: EV travel-time equality violated");
+            }
+            double minimumDeparture = route.arrivalTimes.get(i + 1) + Constants.EV_SERVICE_TIME
+                    + route.launchCountAtNode(customerId) * (Constants.DRONE_T1 + Constants.DRONE_T2);
+            if (route.departureTimes.get(i + 1) + EPS < minimumDeparture) {
+                out.add("Eq.13: EV leaves customer too early");
             }
         }
-
-        for (DroneTrip dt : sol.allDroneTrips) {
-            served.merge(dt.serveNodeId, 1, Integer::sum);
+        int last = route.customerIds.size();
+        double expectedEnd = route.departureTimes.get(last) + TimeUtil.travelTime(
+                route.departureTimes.get(last),
+                DataLoader.distance(nodes.get(last), nodes.get(last + 1)) * Constants.DETOUR_COEFF);
+        if (Math.abs(expectedEnd - route.arrivalTimes.get(last + 1)) > 1e-6) {
+            out.add("Eq.11/12: EV final travel-time equality violated");
         }
-
-        return served;
     }
 
-    private static Map<Integer, Integer> launchCountByNode(EVRoute route) {
-        Map<Integer, Integer> count = new HashMap<>();
-
-        for (DroneTrip dt : route.droneTrips) {
-            if (dt.launchEVId == route.evId) {
-                count.merge(dt.launchNodeId, 1, Integer::sum);
+    private static void validateDroneTrip(Map<Integer, EVRoute> routes, DroneTrip trip,
+                                          Set<Integer> droneServed, Map<Integer, Integer> launches,
+                                          Map<Integer, Integer> retrieves, List<String> out) {
+        try {
+            Node served = DataLoader.getCustomer(trip.serveNodeId);
+            DataLoader.getNode(trip.launchNodeId);
+            DataLoader.getNode(trip.retrieveNodeId);
+            droneServed.add(trip.serveNodeId);
+            if (served.demand > Constants.DRONE_CAPACITY + EPS) out.add("Eq.35: drone payload exceeds capacity");
+            if (trip.departTime + EPS < Constants.T_START) out.add("Eq.24: drone departs before Ts");
+            double d1 = DataLoader.distance(trip.launchNodeId, trip.serveNodeId);
+            double d2 = DataLoader.distance(trip.serveNodeId, trip.retrieveNodeId);
+            double expectedFlightArrival = trip.departTime + TimeUtil.droneTravelTime(d1 + d2)
+                    + 4.0 * Constants.DRONE_T1;
+            if (Math.abs(expectedFlightArrival - trip.flightArrivalTime) > 1e-6) {
+                out.add("Eq.30/31: drone flight-time equality violated");
             }
-        }
-
-        return count;
-    }
-
-    private static Map<Integer, Integer> retrieveCountByNode(EVRoute route) {
-        Map<Integer, Integer> count = new HashMap<>();
-
-        for (DroneTrip dt : route.droneTrips) {
-            if (dt.retrieveEVId == route.evId) {
-                count.merge(dt.retrieveNodeId, 1, Integer::sum);
+            if (trip.energyUsed > Constants.DRONE_BATTERY - Constants.DRONE_MIN_ENERGY + EPS) {
+                out.add("Eq.18: drone drops below minimum SoC");
             }
-        }
-
-        return count;
-    }
-
-    private static boolean routeDroneCarryFeasible(EVRoute route) {
-        int onboard = 1;
-
-        for (int nodeId : route.customerIds) {
-            int launches = route.launchCountAtNode(nodeId);
-            int retrieves = route.retrieveCountAtNode(nodeId);
-
-            Node node = DataLoader.getNode(nodeId);
-            if (!node.isDepot) {
-                if (launches > 2 || retrieves > 1) {
-                    return false;
+            if (trip.launchEVId > 0) {
+                EVRoute route = routes.get(trip.launchEVId);
+                if (route == null || !route.visitsNode(trip.launchNodeId)) out.add("Eq.19/37: launch EV misses node");
+                else {
+                    launches.merge(trip.launchNodeId, 1, Integer::sum);
+                    if (trip.departTime + EPS < route.getArrivalAtNode(trip.launchNodeId)
+                            + Constants.DRONE_T1 + Constants.DRONE_T2) {
+                        out.add("Eq.34: launch before EV operation completes");
+                    }
                 }
-                if (launches == 2 && retrieves != 1) {
-                    return false;
+            } else if (!DataLoader.depotMap.containsKey(trip.launchNodeId)) {
+                out.add("Eq.40: initial drone launch is not from depot/EV");
+            }
+            if (trip.retrieveEVId > 0) {
+                EVRoute route = routes.get(trip.retrieveEVId);
+                if (route == null || !route.visitsNode(trip.retrieveNodeId)) out.add("Eq.20/21: retrieve EV misses node");
+                else {
+                    retrieves.merge(trip.retrieveNodeId, 1, Integer::sum);
+                    if (trip.rendezvousTime > route.getDepartureAtNode(trip.retrieveNodeId) + EPS) out.add("Eq.26: late retrieval");
+                    double expectedHover = Math.max(0.0, route.getArrivalAtNode(trip.retrieveNodeId) - trip.flightArrivalTime);
+                    if (Math.abs(expectedHover - trip.hoverTime) > 1e-6) out.add("Eq.1: hover inconsistent with schedule");
                 }
+            } else if (!DataLoader.depotMap.containsKey(trip.retrieveNodeId)) {
+                out.add("Eq.5: non-EV retrieval is not a depot");
             }
-
-            Integer next = feasibleOnboardAfterNode(onboard, launches, retrieves);
-            if (next == null) {
-                return false;
-            }
-            onboard = next;
+        } catch (IllegalArgumentException e) {
+            out.add("Invalid drone trip: " + e.getMessage());
         }
-
-        return onboard >= 0 && onboard <= 1;
     }
 
-    private static Integer feasibleOnboardAfterNode(int onboardBefore, int launches, int retrieves) {
-        return feasibleOnboardDfs(onboardBefore, launches, retrieves, new HashSet<>());
+    private static void validateContinuity(DroneTrip previous, DroneTrip next,
+                                           Map<Integer, EVRoute> routes, List<String> out) {
+        if (next.tripIndex != previous.tripIndex + 1) out.add("Eq.41: non-contiguous trip index");
+        if (next.departTime + EPS < previous.availableAfterServiceTime) out.add("Eq.32/41: drone relaunches too early");
+        if (previous.retrieveEVId > 0) {
+            if (next.launchEVId != previous.retrieveEVId || next.launchNodeId != previous.retrieveNodeId) {
+                out.add("Eq.16/38/41: EV-carried drone continuity is broken");
+            }
+        } else if (next.launchEVId >= 0 || next.launchNodeId != previous.retrieveNodeId) {
+            out.add("Eq.32/41: depot drone continuity is broken");
+        }
     }
 
-    private static Integer feasibleOnboardDfs(int onboard, int launchesLeft, int retrievesLeft, Set<String> seen) {
-        if (onboard < 0 || onboard > 1) {
-            return null;
-        }
-        if (launchesLeft == 0 && retrievesLeft == 0) {
-            return onboard;
-        }
-
-        String key = onboard + "/" + launchesLeft + "/" + retrievesLeft;
-        if (!seen.add(key)) {
-            return null;
-        }
-
-        if (launchesLeft > 0 && onboard > 0) {
-            Integer afterLaunch = feasibleOnboardDfs(onboard - 1, launchesLeft - 1, retrievesLeft, seen);
-            if (afterLaunch != null) {
-                return afterLaunch;
+    private static void validateCarriedArcs(Solution solution, List<String> out) {
+        for (EVRoute route : solution.evRoutes) {
+            for (Map.Entry<String, Integer> entry : route.carriedDroneByArc.entrySet()) {
+                if (entry.getValue() == null || entry.getValue() <= 0) out.add("Eq.15: invalid carried drone arc");
+            }
+            for (DroneTrip trip : solution.allDroneTrips) {
+                if (trip.launchEVId != route.evId || DataLoader.depotMap.containsKey(trip.launchNodeId)) continue;
+                int index = route.customerIds.indexOf(trip.launchNodeId);
+                boolean inbound = index >= 0 && route.carriedDroneOnArc(
+                        index == 0 ? route.startDepotId : route.customerIds.get(index - 1),
+                        trip.launchNodeId) != null;
+                boolean sameNodeRetrieve = solution.allDroneTrips.stream().anyMatch(other ->
+                        other.droneId == trip.droneId && other.tripIndex == trip.tripIndex - 1
+                                && other.retrieveEVId == route.evId && other.retrieveNodeId == trip.launchNodeId);
+                if (!inbound && !sameNodeRetrieve) out.add("Eq.16/17/38: drone not carried to launch node");
             }
         }
-
-        if (retrievesLeft > 0 && onboard < 1) {
-            Integer afterRetrieve = feasibleOnboardDfs(onboard + 1, launchesLeft, retrievesLeft - 1, seen);
-            if (afterRetrieve != null) {
-                return afterRetrieve;
-            }
-        }
-
-        return null;
     }
 
-    private static Map<Integer, List<DroneTrip>> tripsByDrone(Solution sol) {
-        Map<Integer, List<DroneTrip>> byDrone = new HashMap<>();
-
-        for (DroneTrip dt : sol.allDroneTrips) {
-            byDrone.computeIfAbsent(dt.droneId, k -> new ArrayList<>()).add(dt);
+    private static boolean hasInboundDrone(Map<Integer, EVRoute> routes, int nodeId) {
+        for (EVRoute route : routes.values()) {
+            int index = route.customerIds.indexOf(nodeId);
+            if (index >= 0) {
+                int previous = index == 0 ? route.startDepotId : route.customerIds.get(index - 1);
+                if (route.carriedDroneOnArc(previous, nodeId) != null) return true;
+            }
         }
+        return false;
+    }
 
-        return byDrone;
+    private static Map<Integer, Integer> servedCustomerCount(Solution solution) {
+        Map<Integer, Integer> result = new HashMap<>();
+        for (EVRoute route : solution.evRoutes) for (int id : route.customerIds) result.merge(id, 1, Integer::sum);
+        for (DroneTrip trip : solution.allDroneTrips) result.merge(trip.serveNodeId, 1, Integer::sum);
+        return result;
+    }
+
+    private static Map<Integer, Integer> depotCounts() {
+        Map<Integer, Integer> counts = new HashMap<>();
+        for (Node depot : DataLoader.depots) counts.put(depot.id, 0);
+        return counts;
+    }
+
+    private static double finalReturnTime(DroneTrip last, Map<Integer, EVRoute> routes) {
+        if (last.retrieveEVId < 0) return last.rendezvousTime;
+        EVRoute route = routes.get(last.retrieveEVId);
+        return route == null ? Double.POSITIVE_INFINITY : route.arrivalTimes.get(route.arrivalTimes.size() - 1);
+    }
+
+    public static EVRoute findRoute(Solution solution, int evId) {
+        return ScheduleEvaluator.routesById(solution).get(evId);
     }
 }

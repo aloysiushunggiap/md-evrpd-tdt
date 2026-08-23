@@ -24,6 +24,8 @@ public class ICGA {
     }
 
     public static Solution solve() {
+        // Reproducibility is essential when comparing the paper's operators.
+        rand.setSeed(Constants.RANDOM_SEED);
         int n = DataLoader.customers.size();
 
         int popSize = choosePopSize(n);
@@ -311,6 +313,10 @@ public class ICGA {
 
         int i = rand.nextInt(result.size());
         int j = rand.nextInt(result.size());
+
+        while (j == i) {
+            j = rand.nextInt(result.size());
+        }
 
         if (i > j) {
             int tmp = i;
