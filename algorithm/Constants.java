@@ -67,10 +67,12 @@ public class Constants {
     public static final double AIR_DENSITY = 1.225;      // rho
     public static final double ROTATING_MASS_FACTOR = 1.05; // delta
 
-    // Paper có thành phần gia tốc a trong Eq.(50)-(51).
-    // Với heuristic route-level hiện tại, dùng xấp xỉ a = 0 để tránh bẻ lệch mô hình
-    // bằng giả định ngoài paper.
-    public static final double EV_ACCELERATION = 0.0;
+    /*
+     * Eq.(50) contains acceleration.  The paper gives the time-dependent speed
+     * curve, therefore the baseline derives a(t) from Eq.(48) in TimeUtil
+     * (with the appropriate km/h-per-hour -> m/s2 conversion).  Do not replace
+     * it with a tuned constant.
+     */
 
     // =========================================================
     // GA/VNS search range
@@ -79,11 +81,14 @@ public class Constants {
     public static final int POP_SIZE_MEDIUM = 70;
     public static final int POP_SIZE_LARGE = 100;
 
-    public static final int MAX_GEN_SMALL = 60;
+    // Paper: max_gen must remain in [50, 150], increasing with instance scale.
+    public static final int MAX_GEN_SMALL = 50;
     public static final int MAX_GEN_MEDIUM = 100;
     public static final int MAX_GEN_LARGE = 150;
 
     public static final double CHAOTIC_R = 4.0;
+    /** Reproducible baseline seed; callers may expose this in a later experiment config. */
+    public static final long RANDOM_SEED = 42L;
 
     // =========================================================
     // HEURISTIC PARAMETERS
@@ -110,9 +115,9 @@ public class Constants {
 
     public static final double BIG_M = 1e6;
 
-    // Bật nếu dùng trực tiếp benchmark p02/p04 gốc của MDVRP như paper.
-    // Tắt nếu dữ liệu đầu vào đã được chỉnh demand sẵn.
-    public static final boolean NORMALIZE_PAPER_DEMAND = true;
+    // Input is always read verbatim.  Paper-specific dataset preparation must
+    // be performed explicitly outside the solver, never inferred from a name.
+    public static final boolean NORMALIZE_PAPER_DEMAND = false;
 
     // =========================================================
     // PENALTY

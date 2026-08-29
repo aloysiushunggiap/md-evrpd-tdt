@@ -68,6 +68,7 @@ public class Solution {
                     new HashMap<>(oldRoute.departureTimeByCustomerNode);
             newRoute.arrivalTimeByCustomerNode =
                     new HashMap<>(oldRoute.arrivalTimeByCustomerNode);
+            newRoute.carriedDroneByArc = new HashMap<>(oldRoute.carriedDroneByArc);
 
             newRoute.energyUsed = oldRoute.energyUsed;
             newRoute.totalCost = oldRoute.totalCost;

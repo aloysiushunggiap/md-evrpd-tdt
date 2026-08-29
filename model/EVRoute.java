@@ -29,6 +29,8 @@ public class EVRoute {
     public List<Double> loads;
     public Map<Integer, Double> departureTimeByCustomerNode;
     public Map<Integer, Double> arrivalTimeByCustomerNode;
+    /** Arc key "from->to" to the single drone carried by this EV on that arc. */
+    public Map<String, Integer> carriedDroneByArc;
 
     public double energyUsed;
     public double totalCost;
@@ -47,6 +49,7 @@ public class EVRoute {
         this.loads = new ArrayList<>();
         this.departureTimeByCustomerNode = new HashMap<>();
         this.arrivalTimeByCustomerNode = new HashMap<>();
+        this.carriedDroneByArc = new HashMap<>();
     }
 
     /**
@@ -71,6 +74,7 @@ public class EVRoute {
                 new HashMap<>(other.departureTimeByCustomerNode);
         this.arrivalTimeByCustomerNode =
                 new HashMap<>(other.arrivalTimeByCustomerNode);
+        this.carriedDroneByArc = new HashMap<>(other.carriedDroneByArc);
         this.energyUsed = other.energyUsed;
         this.totalCost = other.totalCost;
         this.feasible = other.feasible;
@@ -198,5 +202,13 @@ public class EVRoute {
      */
     public boolean isRemovableEmptyRoute() {
         return customerIds.isEmpty() && droneTrips.isEmpty();
+    }
+
+    public static String arcKey(int fromNodeId, int toNodeId) {
+        return fromNodeId + "->" + toNodeId;
+    }
+
+    public Integer carriedDroneOnArc(int fromNodeId, int toNodeId) {
+        return carriedDroneByArc.get(arcKey(fromNodeId, toNodeId));
     }
 }

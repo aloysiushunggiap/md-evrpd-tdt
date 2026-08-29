@@ -8,14 +8,18 @@ import java.util.Locale;
 
 public class Main {
 
-    private static final String DEFAULT_DATA_DIR =
-            "D:\\Nghien cuu thuat toan\\huyrebuild\\src\\data";
+    private static final String DEFAULT_DATA_DIR = "D:\\Nghien cuu thuat toan\\huyrebuild\\src\\data\\";
 
     public static void main(String[] args) {
 
         System.out.println("=== MD-EVRPD-TDT Solver (ICGA) ===");
 
-        String instanceArg = args.length > 0 ? args[0].trim() : "p14";
+        String instanceArg = "p06";
+        boolean exportCsv = false;
+        for (String arg : args) {
+            if ("--csv".equalsIgnoreCase(arg)) exportCsv = true;
+            else if (!arg.startsWith("--")) instanceArg = arg.trim();
+        }
 
         String path;
 
@@ -73,6 +77,8 @@ public class Main {
         // ===== Export CSV =====
         String instanceName = new File(path).getName();
 
-        CsvExporter.appendResult(instanceName, best, end - start, "result.csv");
+        if (exportCsv) {
+            CsvExporter.appendResult(instanceName, best, end - start, "result.csv");
+        }
     }
 }

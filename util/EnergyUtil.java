@@ -28,9 +28,7 @@ public class EnergyUtil {
      * Trong đó:
      * - m = m0 + load
      * - v(t) tính theo km/h
-     * - a trong paper có xuất hiện, nhưng ở heuristic route-level hiện tại
-     *   không có profile gia tốc theo từng chặng, nên dùng hằng số a = 0
-     *   để tránh tự ý đưa thêm mô hình ngoài paper.
+     * - a(t) is derived from the paper's time-dependent speed polynomial.
      *
      * @param departTime thời điểm xuất phát (giờ)
      * @param travelTime thời gian di chuyển trên chặng (giờ)
@@ -45,53 +43,42 @@ public class EnergyUtil {
         double m = Constants.EV_MASS_EMPTY + Math.max(0.0, load);
         double eta = Constants.ETA_T * Constants.ETA_V * Constants.ETA_M;
 
-        int steps = 12;
-        if (steps % 2 == 1) {
-            steps++;
+        return adaptiveSimpson(departTime, departTime + travelTime, m, eta, 1e-9, 20);
+    }
+
+    private static double power(double t, double mass, double eta) {
+        double vKmh = TimeUtil.speed(t);
+        double rollingTerm = mass * Constants.GRAVITY * Constants.ROLLING_COEFF;
+        double aeroTerm = Constants.DRAG_COEFF * Constants.FRONTAL_AREA * vKmh * vKmh / 21.15;
+        double accelTerm = Constants.ROTATING_MASS_FACTOR * mass
+                * TimeUtil.accelerationMetersPerSecondSquared(t);
+        return vKmh * (rollingTerm + aeroTerm + accelTerm) / (3600.0 * eta);
+    }
+
+    private static double adaptiveSimpson(double a, double b, double mass, double eta,
+                                          double tolerance, int depth) {
+        double c = (a + b) / 2.0;
+        double whole = simpson(a, b, mass, eta);
+        return adaptiveSimpson(a, b, c, whole, mass, eta, tolerance, depth);
+    }
+
+    private static double adaptiveSimpson(double a, double b, double c, double whole,
+                                          double mass, double eta, double tolerance, int depth) {
+        double left = simpson(a, c, mass, eta);
+        double right = simpson(c, b, mass, eta);
+        double delta = left + right - whole;
+        if (depth <= 0 || Math.abs(delta) <= 15.0 * tolerance) {
+            return left + right + delta / 15.0;
         }
+        double d = (a + c) / 2.0;
+        double e = (c + b) / 2.0;
+        return adaptiveSimpson(a, c, d, left, mass, eta, tolerance / 2.0, depth - 1)
+                + adaptiveSimpson(c, b, e, right, mass, eta, tolerance / 2.0, depth - 1);
+    }
 
-        double h = travelTime / steps;
-        double weightedPowerSum = 0.0;
-
-        for (int i = 0; i <= steps; i++) {
-            double t = departTime + i * h;
-
-            // Paper dùng v(t) theo km/h
-            double vKmh = TimeUtil.speed(t);
-
-            // Eq.(50):
-            // m*g*f
-            double rollingTerm = m * Constants.GRAVITY * Constants.ROLLING_COEFF;
-
-            // C_D * A * v^2 / 21.15
-            double aeroTerm = Constants.DRAG_COEFF
-                    * Constants.FRONTAL_AREA
-                    * vKmh * vKmh / 21.15;
-
-            // delta * m * a
-            double accelTerm = Constants.ROTATING_MASS_FACTOR
-                    * m
-                    * Constants.EV_ACCELERATION;
-
-            // instantaneous power theo Eq.(50), đơn vị kW khi dùng hệ số 3600 như paper
-            double powerKw = (1.0 / (3600.0 * eta))
-                    * vKmh
-                    * (rollingTerm + aeroTerm + accelTerm);
-
-            double weight;
-            if (i == 0 || i == steps) {
-                weight = 1.0;
-            } else if (i % 2 == 0) {
-                weight = 2.0;
-            } else {
-                weight = 4.0;
-            }
-
-            weightedPowerSum += weight * powerKw;
-        }
-
-        // Simpson integration: kW * h = kWh
-        return weightedPowerSum * h / 3.0;
+    private static double simpson(double a, double b, double mass, double eta) {
+        double c = (a + b) / 2.0;
+        return (b - a) / 6.0 * (power(a, mass, eta) + 4.0 * power(c, mass, eta) + power(b, mass, eta));
     }
 
     /**
