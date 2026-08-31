@@ -104,9 +104,26 @@ public class DataLoader {
             int id = Integer.parseInt(p[0]);
             double x = Double.parseDouble(p[1]);
             double y = Double.parseDouble(p[2]);
-            // Never change input data based on an instance name.  The paper's
-            // dataset construction is a preprocessing concern, not solver logic.
             double demand = Double.parseDouble(p[4]);
+
+            /*
+             * Paper section 7 dataset preparation: "Considering the limited payload
+             * capacity of the drone, subtract 10 and 15, for the customers who have
+             * demand 11-15 and 16-19."
+             *
+             * Without this the drone half of the model is inert: against Qu = 5 kg only
+             * 4-15% of the raw MDVRP customers are drone-eligible (p03 yields none at
+             * all), so Stage 1 and Stage 3 have almost nothing to assign.  Applying it
+             * brings p01 to 23/50 and p04 to 50/100 drone-eligible customers.
+             *
+             * This rewrites the input, so it is deliberately keyed off the demand value
+             * only -- never off the instance name.
+             */
+            if (demand >= 11.0 && demand <= 15.0) {
+                demand -= 10.0;
+            } else if (demand >= 16.0 && demand <= 19.0) {
+                demand -= 15.0;
+            }
 
             Node customer = new Node(id, x, y, demand, false);
             customer.readyTime = Constants.T_START;
@@ -165,6 +182,7 @@ public class DataLoader {
         System.out.println("Depots      : " + depots.size());
         System.out.println("EVs/depot   : " + numEV);
         System.out.println("Drone pool  : sufficient (paper assumption; no hard cap)");
+        System.out.println("Demand prep : paper section 7 (11-15 -> -10, 16-19 -> -15)");
         System.out.println("Drone-able  : " + droneEligible + " / " + customers.size());
         System.out.println("===================");
     }

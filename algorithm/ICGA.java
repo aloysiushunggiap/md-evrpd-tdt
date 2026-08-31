@@ -26,6 +26,8 @@ public class ICGA {
     public static Solution solve() {
         // Reproducibility is essential when comparing the paper's operators.
         rand.setSeed(Constants.RANDOM_SEED);
+        Decoder.resetObjectiveEvaluations();
+        long startTime = System.currentTimeMillis();
         int n = DataLoader.customers.size();
 
         int popSize = choosePopSize(n);
@@ -45,9 +47,7 @@ public class ICGA {
                 for (int i = 0; i < population.size(); i++) {
                     Individual current = population.get(i);
 
-                    List<Integer> newChromosome = applyOperator(current.chromosome, operator);
-                    Individual candidate = new Individual(newChromosome);
-                    evaluateIndividual(candidate);
+                    Individual candidate = bestOfTrials(current.chromosome, operator, Constants.OPERATOR_TRIALS);
 
                     boolean currentFeasible = current.solution != null && current.solution.feasible;
                     boolean candidateFeasible = candidate.solution != null && candidate.solution.feasible;
@@ -93,7 +93,7 @@ public class ICGA {
                     .count();
 
             System.out.printf(Locale.US,
-                    "Gen %3d | Cost=%.2f | AvgCost=%.2f | AvgFit=%.2f | Feasible=%d/%d | EV=%d | Drone=%d | EV-Served=%d | D-Served=%d%n",
+                    "Gen %3d | Cost=%.2f | AvgCost=%.2f | AvgFit=%.2f | Feasible=%d/%d | EV=%d | Drone=%d | EV-Served=%d | D-Served=%d | t=%ds%n",
                     gen,
                     bestSol.totalCost,
                     avgCost,
@@ -103,7 +103,8 @@ public class ICGA {
                     bestSol.totalEVs(),
                     bestSol.totalDrones(),
                     bestSol.totalCustomersServedByEV(),
-                    bestSol.totalCustomersServedByDrone()
+                    bestSol.totalCustomersServedByDrone(),
+                    (System.currentTimeMillis() - startTime) / 1000
             );
 
         }
@@ -231,6 +232,29 @@ public class ICGA {
     // ==========================================================
     // Operators
     // ==========================================================
+
+    /**
+     * Same exchange/insertion/2-opt operators the paper specifies, just tried
+     * OPERATOR_TRIALS times with independent random picks and the best of
+     * those kept -- still a single accepted move per individual per operator,
+     * only the odds of that move actually decoding to a lower-cost Stage 2/3
+     * solution improve.
+     */
+    private static Individual bestOfTrials(List<Integer> chromosome, int operator, int trials) {
+        Individual best = null;
+
+        for (int t = 0; t < trials; t++) {
+            List<Integer> newChromosome = applyOperator(chromosome, operator);
+            Individual candidate = new Individual(newChromosome);
+            evaluateIndividual(candidate);
+
+            if (best == null || compareIndividuals(candidate, best) < 0) {
+                best = candidate;
+            }
+        }
+
+        return best;
+    }
 
     private static List<Integer> applyOperator(List<Integer> chromosome, int operator) {
         switch (operator) {

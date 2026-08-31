@@ -1,4 +1,6 @@
+import algorithm.ALNS;
 import algorithm.ConstraintChecker;
+import algorithm.Decoder;
 import algorithm.ICGA;
 import model.Solution;
 import util.DataLoader;
@@ -12,14 +14,18 @@ public class Main {
 
     public static void main(String[] args) {
 
-        System.out.println("=== MD-EVRPD-TDT Solver (ICGA) ===");
-
         String instanceArg = "p06";
         boolean exportCsv = false;
+        String solver = "icga";
+
         for (String arg : args) {
-            if ("--csv".equalsIgnoreCase(arg)) exportCsv = true;
-            else if (!arg.startsWith("--")) instanceArg = arg.trim();
+            if ("--csv".equalsIgnoreCase(arg))   exportCsv = true;
+            else if ("--alns".equalsIgnoreCase(arg)) solver = "alns";
+            else if ("--icga".equalsIgnoreCase(arg)) solver = "icga";
+            else if (!arg.startsWith("--"))      instanceArg = arg.trim();
         }
+
+        System.out.println("=== MD-EVRPD-TDT Solver (" + solver.toUpperCase() + ") ===");
 
         String path;
 
@@ -41,7 +47,7 @@ public class Main {
         // ===== Start =====
         long start = System.currentTimeMillis();
 
-        Solution best = ICGA.solve();
+        Solution best = solver.equals("alns") ? ALNS.solve() : ICGA.solve();
 
         long end = System.currentTimeMillis();
 
@@ -74,11 +80,15 @@ public class Main {
 
         System.out.printf(Locale.US, "%nRuntime: %.2f seconds%n", (end - start) / 1000.0);
 
+        // Full Stage 3 evaluations -- the only unit comparable across ICGA and ALNS.
+        System.out.println("Objective evaluations: " + Decoder.objectiveEvaluations);
+
         // ===== Export CSV =====
         String instanceName = new File(path).getName();
 
         if (exportCsv) {
-            CsvExporter.appendResult(instanceName, best, end - start, "result.csv");
+            CsvExporter.appendResult(instanceName, solver, best, end - start,
+                    Decoder.objectiveEvaluations, "result.csv");
         }
     }
 }

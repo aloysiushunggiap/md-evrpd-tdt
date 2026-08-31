@@ -77,11 +77,20 @@ public class Constants {
     // =========================================================
     // GA/VNS search range
     // =========================================================
+    /*
+     * Paper section 7: "population size NIND = 50 ~ 100, max_gen = 50 ~ 150.  The larger
+     * the customer scale, the bigger the max_gen value is."  Both scale with instance size
+     * and stay inside those ranges.
+     *
+     * Raising these to the top of the ranges (pop 100 / gen 100 on p01) was measured and
+     * is not worth it: cost moved 730.65 -> 730.54, a 0.015% gain for 4x the runtime and
+     * 4x the objective evaluations.  The decoder, not the search budget, is what binds --
+     * so spend effort there rather than here.
+     */
     public static final int POP_SIZE_SMALL = 50;
     public static final int POP_SIZE_MEDIUM = 70;
     public static final int POP_SIZE_LARGE = 100;
 
-    // Paper: max_gen must remain in [50, 150], increasing with instance scale.
     public static final int MAX_GEN_SMALL = 50;
     public static final int MAX_GEN_MEDIUM = 100;
     public static final int MAX_GEN_LARGE = 150;
@@ -94,10 +103,19 @@ public class Constants {
     // HEURISTIC PARAMETERS
     // =========================================================
 
+    /** NOT WIRED UP: read nowhere in the solver, and matches no line of the ICGA pseudo-code. */
     public static final double ELITE_RATE = 0.10;
-    public static final int OPERATOR_TRIALS = 5;
 
-    // Chưa dùng để “sáng tạo thêm thuật toán”, chỉ dùng để ổn định quần thể
+    /*
+     * Paper pseudo-code line 8 applies each operator EXACTLY ONCE per individual:
+     *     P'i(t) <- Operator Rk(Pi(t))
+     * so 1 is the paper-faithful value.  Setting this above 1 turns ICGA.bestOfTrials into
+     * a best-of-N sampler, which is an extension beyond the paper: it multiplies the number
+     * of objective evaluations by N without giving the individual any extra accepted moves.
+     */
+    public static final int OPERATOR_TRIALS = 1;
+
+    /** NOT WIRED UP: read nowhere in the solver, and matches no line of the ICGA pseudo-code. */
     public static final int DIVERSIFY_PERCENT = 25;
 
     // ----- Stage 1 / Stage 3 -----
@@ -107,17 +125,18 @@ public class Constants {
 
     public static final int STAGE2_INSERT_NEAREST_POSITIONS = 2;
 
-    // Stage 3 search window
-    public static final int STAGE3_MAX_ROUNDS = 10;
+    /*
+     * Stage 3 search window.  These are heuristic knobs of this implementation, NOT paper
+     * parameters -- the paper prescribes the Stage 3 procedure but no candidate limits.
+     * Widening them lets Stage 3 consider more drone assignments, which shortens EV routes
+     * and makes route merging easier, at a roughly proportional cost in runtime.
+     */
+    public static final int STAGE3_MAX_ROUNDS = 20;
     public static final int STAGE3_LAUNCH_LOOKAHEAD = 8;
-    public static final int STAGE3_SERVE_CANDIDATES = 12;
-    public static final int STAGE3_RETRIEVE_CANDIDATES = 12;
+    public static final int STAGE3_SERVE_CANDIDATES = 24;
+    public static final int STAGE3_RETRIEVE_CANDIDATES = 24;
 
     public static final double BIG_M = 1e6;
-
-    // Input is always read verbatim.  Paper-specific dataset preparation must
-    // be performed explicitly outside the solver, never inferred from a name.
-    public static final boolean NORMALIZE_PAPER_DEMAND = false;
 
     // =========================================================
     // PENALTY
@@ -137,11 +156,11 @@ public class Constants {
     public static final double PENALTY_NODE_OPERATION = 300.0;
     public static final double PENALTY_DEPOT_BALANCE = 500.0;
     public static final double PENALTY_CONTINUITY = 600.0;
-    public static final boolean ENABLE_ROUTE_MERGE = false;
-    public static final int ROUTE_IMPROVE_GUARD = 2;
-    public static final int MERGE_IMPROVE_GUARD = 2;
+    public static final boolean ENABLE_ROUTE_MERGE = true;
+    public static final int ROUTE_IMPROVE_GUARD = 5;
+    public static final int MERGE_IMPROVE_GUARD = 5;
 
-    // Dừng sớm nếu nhiều generation liên tiếp không cải thiện best solution.
+    /** NOT WIRED UP: read nowhere in the solver; ICGA always runs the full MAX_GEN. */
     public static final int EARLY_STOP_PATIENCE = 100000;
     private Constants() {
     }

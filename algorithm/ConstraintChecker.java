@@ -230,12 +230,39 @@ public final class ConstraintChecker {
         if (next.tripIndex != previous.tripIndex + 1) out.add("Eq.41: non-contiguous trip index");
         if (next.departTime + EPS < previous.availableAfterServiceTime) out.add("Eq.32/41: drone relaunches too early");
         if (previous.retrieveEVId > 0) {
-            if (next.launchEVId != previous.retrieveEVId || next.launchNodeId != previous.retrieveNodeId) {
+            if (next.launchEVId != previous.retrieveEVId
+                    || !isCarriedContinuously(routes.get(previous.retrieveEVId),
+                    previous.retrieveNodeId, next.launchNodeId, previous.droneId)) {
                 out.add("Eq.16/38/41: EV-carried drone continuity is broken");
             }
         } else if (next.launchEVId >= 0 || next.launchNodeId != previous.retrieveNodeId) {
             out.add("Eq.32/41: depot drone continuity is broken");
         }
+    }
+
+    /**
+     * A retrieved drone may relaunch at the same node or after its retrieve EV
+     * carries it along every intervening arc.  Requiring the next launch node to
+     * equal the retrieve node incorrectly rejected the latter paper-allowed case.
+     */
+    private static boolean isCarriedContinuously(EVRoute route, int fromNodeId,
+                                                  int toNodeId, int droneId) {
+        if (route == null) return false;
+        if (fromNodeId == toNodeId) return true;
+
+        List<Integer> nodes = new ArrayList<>();
+        nodes.add(route.startDepotId);
+        nodes.addAll(route.customerIds);
+        nodes.add(route.endDepotId);
+
+        int from = nodes.indexOf(fromNodeId);
+        int to = nodes.indexOf(toNodeId);
+        if (from < 0 || to < 0 || to <= from) return false;
+        for (int i = from; i < to; i++) {
+            Integer carried = route.carriedDroneOnArc(nodes.get(i), nodes.get(i + 1));
+            if (carried == null || carried != droneId) return false;
+        }
+        return true;
     }
 
     private static void validateCarriedArcs(Solution solution, List<String> out) {

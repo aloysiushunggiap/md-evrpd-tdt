@@ -12,8 +12,20 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 public class Decoder {
-
     private Decoder() {
+    }
+
+    /**
+     * Number of true Eq.1 objective evaluations (a full Stage 3 run) since the last reset.
+     *
+     * This is the only unit in which ICGA and ALNS can be compared fairly: ALNS accepts most
+     * of its moves on the cheap EV-only proxy and reaches Stage 3 only a few dozen times per
+     * run, whereas ICGA pays for a complete Stage 3 on every candidate it evaluates.
+     */
+    public static long objectiveEvaluations;
+
+    public static void resetObjectiveEvaluations() {
+        objectiveEvaluations = 0;
     }
 
     public static Solution decode(List<Integer> chromosome) {
@@ -54,6 +66,71 @@ public class Decoder {
 
         return sol;
     }
+    /**
+     * Discard Stage 3 output (every EV-launched or EV-retrieved drone trip) while keeping
+     * the Stage 1 depot-drone trips (Depot -> Customer -> Depot).
+     *
+     * Those Stage 1 trips are the *only* thing serving their customers: assignDepotDrones
+     * excludes them from Stage 2, so they appear in no EV route.  Clearing allDroneTrips
+     * wholesale therefore drops them from the solution entirely and Eq.8 fails with
+     * "customer N served 0 times" -- Stage 3 cannot recover them because it can only
+     * launch drones from EV routes, never from a depot.
+     *
+     * The Stage 3 trips that *are* discarded leak their customers the same way, for the
+     * opposite reason: applySequentialDroneMove pulls a customer out of its EV route when
+     * it hands it to a drone, so once the trip goes the customer is in no route either.
+     * Every such customer is therefore reinserted into the EV routes here.  This stayed
+     * hidden while barely any customer was drone-eligible; the paper's section 7 demand
+     * preparation lifts that to ~50%, which made it a systematic loss.
+     */
+    static void clearStage3DroneTrips(Solution sol) {
+        List<Integer> orphaned = new ArrayList<>();
+        for (DroneTrip dt : sol.allDroneTrips) {
+            if (!(dt.launchedFromDepot() && dt.retrievedToDepot())) {
+                orphaned.add(dt.serveNodeId);
+            }
+        }
+
+        sol.allDroneTrips.removeIf(dt -> !(dt.launchedFromDepot() && dt.retrievedToDepot()));
+        for (EVRoute r : sol.evRoutes) r.droneTrips.clear();
+
+        for (int cid : orphaned) {
+            insertCustomerMinimumCost(sol, cid);
+        }
+    }
+
+    /**
+     * Entry point for ALNS: given a Solution with EV routes already built,
+     * run Stage 3 drone integration + post-processing and evaluate the result.
+     */
+    public static void runStage3AndEvaluate(Solution sol) {
+        clearStage3DroneTrips(sol);
+        pruneEmptyRoutes(sol);
+        assignPaperClosestEndDepots(sol);
+        refreshAllRoutes(sol);
+        assignPaperCollaborativeDroneTrips(sol);
+        computeCost(sol);
+        sol.totalPenalty = ConstraintChecker.penalty(sol);
+        sol.feasible = ConstraintChecker.isFeasible(sol);
+    }
+
+    /**
+     * Apply intra-route 2-opt to every EV route in sol, then re-run Stage 3.
+     * Expensive — call only on accepted / best solutions, not every iteration.
+     */
+    public static void applyLocalSearchAndEvaluate(Solution sol) {
+        clearStage3DroneTrips(sol);
+        pruneEmptyRoutes(sol);
+        assignPaperClosestEndDepots(sol);
+        refreshAllRoutes(sol);
+        for (EVRoute r : sol.evRoutes) intraRoute2Opt(r);
+        refreshAllRoutes(sol);
+        assignPaperCollaborativeDroneTrips(sol);
+        computeCost(sol);
+        sol.totalPenalty = ConstraintChecker.penalty(sol);
+        sol.feasible = ConstraintChecker.isFeasible(sol);
+    }
+
     // ==========================================================
     // Stage 1: depot drones
     // ==========================================================
@@ -217,8 +294,11 @@ public class Decoder {
         List<EVRoute> routes = new ArrayList<>();
         int nextEvId = 1;
 
-        // Stage 2 in Section 6.1.2 is depot-centric: retain chromosome order
-        // inside a cluster, but start each cluster from its nearest customer.
+        /*
+         * Stage 2 (Section 6.1.2): after removing depot-drone customers, cluster the
+         * remaining genes around their nearest depot.  Within a cluster only the seed
+         * is chosen by proximity; every later gene is appended in chromosome order.
+         */
         Map<Integer, List<Integer>> clusters = new LinkedHashMap<>();
         List<Node> depots = new ArrayList<>(DataLoader.depots);
         depots.sort(Comparator.comparingInt(d -> d.id));
@@ -232,76 +312,114 @@ public class Decoder {
             List<Integer> customers = clusters.get(depot.id);
             if (customers == null || customers.isEmpty()) continue;
 
-            int nearestIndex = 0;
-            double nearestDistance = Double.POSITIVE_INFINITY;
-            for (int i = 0; i < customers.size(); i++) {
-                double distance = DataLoader.distance(depot.id, customers.get(i));
-                if (distance < nearestDistance) {
-                    nearestDistance = distance;
-                    nearestIndex = i;
-                }
-            }
-            if (nearestIndex != 0) {
-                Integer nearest = customers.remove(nearestIndex);
-                customers.add(0, nearest);
-            }
+            promoteNearestCustomerToFront(customers, depot.id);
 
             EVRoute current = null;
             for (int cid : customers) {
                 if (current == null) {
                     current = new EVRoute(nextEvId++, depot.id);
                     current.customerIds.add(cid);
-                    rebuildRouteWithBestTemporaryEndDepot(current);
-                    routes.add(current);
+                    preparePaperRouteForFeasibilityCheck(current);
                     continue;
                 }
 
                 EVRoute appended = new EVRoute(current);
                 appended.customerIds.add(cid);
                 if (rebuildRouteWithBestTemporaryEndDepot(appended)) {
-                    current.customerIds.add(cid);
-                    rebuildRoute(current, current.startDepotId, appended.endDepotId);
+                    // Sequential insertion: retain precisely this near-to-far order.
+                    current = appended;
                 } else {
-                    // Virtual depot 0: terminate this route and dispatch a new
-                    // EV from the cluster depot before the next chromosome gene.
+                    /*
+                     * The paper inserts virtual depot 0 immediately before cid.
+                     * In the object model, closing the current EVRoute and opening
+                     * another one is the lossless representation of that marker:
+                     * ... -> current.lastCustomer -> 0 -> cid -> ...
+                     */
+                    closePaperRouteAtVirtualDepot(routes, current);
                     current = new EVRoute(nextEvId++, depot.id);
                     current.customerIds.add(cid);
-                    rebuildRouteWithBestTemporaryEndDepot(current);
-                    routes.add(current);
+                    preparePaperRouteForFeasibilityCheck(current);
                 }
             }
+
+            // The final virtual depot 0 terminates the final route of this cluster.
+            closePaperRouteAtVirtualDepot(routes, current);
         }
 
         return routes;
     }
 
     /**
+     * Paper 6.1.2 Stage 2: "the nearest customer is selected to initiate the first EV
+     * route".  Only that seed is chosen by proximity -- every later customer keeps the
+     * chromosome's order, per the same paragraph's "after formulating the entire
+     * chromosome".
+     *
+     * Sorting the whole cluster near-to-far instead would make decodePaperICGA a constant
+     * function of the permutation: the chromosome is used only to fill the cluster lists,
+     * so a total-order sort right afterwards erases it.  Every ICGA operator would then be
+     * a no-op on the objective and the cost could never improve across generations.
+     */
+    private static void promoteNearestCustomerToFront(List<Integer> customers, int depotId) {
+        if (customers.size() < 2) return;
+
+        int bestIdx = 0;
+        double bestDist = DataLoader.distance(depotId, customers.get(0));
+        for (int i = 1; i < customers.size(); i++) {
+            double d = DataLoader.distance(depotId, customers.get(i));
+            if (d < bestDist - 1e-12) {
+                bestDist = d;
+                bestIdx = i;
+            }
+        }
+
+        if (bestIdx == 0) return;
+        customers.add(0, customers.remove(bestIdx));
+    }
+
+    private static void preparePaperRouteForFeasibilityCheck(EVRoute route) {
+        if (!rebuildRouteWithBestTemporaryEndDepot(route)) {
+            /*
+             * A singleton that cannot satisfy capacity, minimum SoC, or depot
+             * hours cannot be repaired by splitting. Keep a fully evaluated route
+             * so the solution-level checker reports the real infeasibility.
+             */
+            rebuildRoute(route, route.startDepotId, route.startDepotId);
+        }
+    }
+
+    private static void closePaperRouteAtVirtualDepot(List<EVRoute> routes,
+                                                       EVRoute route) {
+        if (route == null) return;
+        // Depot 0 is a conceptual separator, never a physical EVRoute node.
+        routes.add(route);
+    }
+
+    /**
      * During the route-splitting pass the final open return-depot assignment is not
-     * known yet.  Use the feasible depot requiring the least EV energy as a temporary
-     * end, then let assignPaperClosestEndDepots enforce the paper's depot balance.
+     * known yet.  The paper chooses the closest feasible return depot from the
+     * route's last customer; depot balance is then enforced by
+     * assignPaperClosestEndDepots.
      */
     private static boolean rebuildRouteWithBestTemporaryEndDepot(EVRoute route) {
-        EVRoute best = null;
+        int lastNodeId = route.customerIds.isEmpty()
+                ? route.startDepotId
+                : route.customerIds.get(route.customerIds.size() - 1);
+        List<Node> candidates = new ArrayList<>(DataLoader.depots);
+        candidates.sort(Comparator
+                .comparingDouble((Node depot) -> DataLoader.distance(lastNodeId, depot.id))
+                .thenComparingInt(depot -> depot.id));
 
-        for (Node depot : DataLoader.depots) {
+        for (Node depot : candidates) {
             EVRoute test = new EVRoute(route);
             rebuildRoute(test, test.startDepotId, depot.id);
 
-            if (!routeLevelFeasible(test)) {
-                continue;
-            }
-
-            if (best == null || test.energyUsed < best.energyUsed) {
-                best = test;
+            if (routeLevelFeasible(test)) {
+                rebuildRoute(route, route.startDepotId, depot.id);
+                return true;
             }
         }
-
-        if (best == null) {
-            return false;
-        }
-
-        rebuildRoute(route, route.startDepotId, best.endDepotId);
-        return true;
+        return false;
     }
 
     private static Insertion findBestInsertion(List<EVRoute> routes, int cid) {
@@ -371,7 +489,7 @@ public class Decoder {
     // Route improvement
     // ==========================================================
 
-    private static boolean routeLevelFeasible(EVRoute route) {
+    static boolean routeLevelFeasible(EVRoute route) {
         if (route.totalDemandServedByEVAndDrone() > Constants.EV_CAPACITY + 1e-9) {
             return false;
         }
@@ -423,12 +541,11 @@ public class Decoder {
         int dSize = depots.size();
 
         /*
-         * Precompute candidate energy:
-         * energyMatrix[i][j] = EV route i quay về depot j có feasible không, năng lượng bao nhiêu.
-         *
-         * Nhờ vậy searchBestEndDepotAssignmentFast không phải rebuildRoute lặp lại.
+         * Precompute feasible return depots. This fallback is only reached if
+         * greedy nearest assignment blocks a later route. Its objective is total
+         * Euclidean return distance, matching the paper's nearest-depot rule.
          */
-        double[][] energyMatrix = new double[rSize][dSize];
+        double[][] returnDistanceMatrix = new double[rSize][dSize];
         boolean[][] feasibleMatrix = new boolean[rSize][dSize];
 
         for (int i = 0; i < rSize; i++) {
@@ -442,16 +559,19 @@ public class Decoder {
 
                 if (routeLevelFeasible(test)) {
                     feasibleMatrix[i][j] = true;
-                    energyMatrix[i][j] = test.energyUsed;
+                    int lastNodeId = route.customerIds.isEmpty()
+                            ? route.startDepotId
+                            : route.customerIds.get(route.customerIds.size() - 1);
+                    returnDistanceMatrix[i][j] = DataLoader.distance(lastNodeId, depotId);
                 } else {
                     feasibleMatrix[i][j] = false;
-                    energyMatrix[i][j] = Double.POSITIVE_INFINITY;
+                    returnDistanceMatrix[i][j] = Double.POSITIVE_INFINITY;
                 }
             }
         }
 
         OpenDepotAssignment best = new OpenDepotAssignment();
-        best.totalEnergy = Double.POSITIVE_INFINITY;
+        best.totalReturnDistance = Double.POSITIVE_INFINITY;
         best.endDepots = new int[rSize];
 
         Map<Integer, Integer> used = new HashMap<>();
@@ -461,7 +581,7 @@ public class Decoder {
 
         int[] currentEndDepots = new int[rSize];
 
-        searchBestEndDepotAssignmentFast(
+        searchClosestBalancedEndDepotAssignment(
                 routes,
                 depots,
                 0,
@@ -471,10 +591,10 @@ public class Decoder {
                 0.0,
                 best,
                 feasibleMatrix,
-                energyMatrix
+                returnDistanceMatrix
         );
 
-        if (Double.isInfinite(best.totalEnergy)) {
+        if (Double.isInfinite(best.totalReturnDistance)) {
             /*
              * Fallback an toàn.
              * Nếu không tìm được tổ hợp open depot feasible, quay về depot xuất phát.
@@ -515,9 +635,9 @@ public class Decoder {
                     : route.customerIds.get(route.customerIds.size() - 1);
 
             List<Node> candidates = new ArrayList<>(DataLoader.depots);
-            candidates.sort(Comparator.comparingDouble(
-                    depot -> DataLoader.distance(lastNodeId, depot.id)
-            ));
+            candidates.sort(Comparator
+                    .comparingDouble((Node depot) -> DataLoader.distance(lastNodeId, depot.id))
+                    .thenComparingInt(depot -> depot.id));
 
             boolean assigned = false;
             for (Node depot : candidates) {
@@ -547,17 +667,17 @@ public class Decoder {
             }
         }
     }
-    private static void searchBestEndDepotAssignmentFast(List<EVRoute> routes,
-                                                         List<Node> depots,
-                                                         int index,
-                                                         Map<Integer, Integer> quota,
-                                                         Map<Integer, Integer> used,
-                                                         int[] currentEndDepots,
-                                                         double currentEnergy,
-                                                         OpenDepotAssignment best,
-                                                         boolean[][] feasibleMatrix,
-                                                         double[][] energyMatrix) {
-        if (currentEnergy >= best.totalEnergy - 1e-9) {
+    private static void searchClosestBalancedEndDepotAssignment(List<EVRoute> routes,
+                                                                 List<Node> depots,
+                                                                 int index,
+                                                                 Map<Integer, Integer> quota,
+                                                                 Map<Integer, Integer> used,
+                                                                 int[] currentEndDepots,
+                                                                 double currentReturnDistance,
+                                                                 OpenDepotAssignment best,
+                                                                 boolean[][] feasibleMatrix,
+                                                                 double[][] returnDistanceMatrix) {
+        if (currentReturnDistance >= best.totalReturnDistance - 1e-9) {
             return;
         }
 
@@ -572,7 +692,7 @@ public class Decoder {
                 }
             }
 
-            best.totalEnergy = currentEnergy;
+            best.totalReturnDistance = currentReturnDistance;
             best.endDepots = Arrays.copyOf(currentEndDepots, currentEndDepots.length);
             return;
         }
@@ -592,17 +712,17 @@ public class Decoder {
             used.merge(depotId, 1, Integer::sum);
             currentEndDepots[index] = depotId;
 
-            searchBestEndDepotAssignmentFast(
+            searchClosestBalancedEndDepotAssignment(
                     routes,
                     depots,
                     index + 1,
                     quota,
                     used,
                     currentEndDepots,
-                    currentEnergy + energyMatrix[index][depotIndex],
+                    currentReturnDistance + returnDistanceMatrix[index][depotIndex],
                     best,
                     feasibleMatrix,
-                    energyMatrix
+                    returnDistanceMatrix
             );
 
             used.merge(depotId, -1, Integer::sum);
@@ -736,6 +856,13 @@ public class Decoder {
     }
 
     private static void assignPaperCollaborativeDroneTrips(Solution sol) {
+        /*
+         * Single counting point for objectiveEvaluations: decodePaperICGA,
+         * runStage3AndEvaluate and applyLocalSearchAndEvaluate each reach Stage 3 exactly
+         * once, and repairPaperSolution never calls this, so there is no double count.
+         */
+        objectiveEvaluations++;
+
         refreshAllRoutes(sol);
         // Stage 3 evaluates every candidate against the current objective.
         computeCost(sol);
@@ -805,12 +932,157 @@ public class Decoder {
             }
         }
 
+        /*
+         * The main loop above only creates/moves drone trips; it never revisits
+         * an earlier commitment to check whether a cheaper retrieve node opened
+         * up afterward. Re-run the retrieve-node search now that EV routes are
+         * settled, then try merging under-utilized EVs (ENABLE_ROUTE_MERGE) --
+         * EV_DISPATCH_COST dominates the other Eq.1 terms, so cutting EV count
+         * is the single largest cost lever available at this stage.
+         */
+        improvePaperDepotDroneRetrieveByEV(sol, droneStates);
+        mergeUnderutilizedRoutes(sol);
+
         pruneEmptyRoutes(sol);
         assignPaperClosestEndDepots(sol);
         refreshAllRoutes(sol);
         computeCost(sol);
         sol.totalPenalty = ConstraintChecker.penalty(sol);
         sol.feasible = ConstraintChecker.isFeasible(sol);
+    }
+
+    // ==========================================================
+    // Route merge (heuristic-only post-processing, not a paper stage)
+    // ==========================================================
+    /**
+     * EV_DISPATCH_COST (300) dwarfs every other Eq.1 term, so folding two
+     * under-utilized EV routes from the same depot cluster into one is the
+     * highest-leverage cost cut available after Stage 3 settles. Guarded by
+     * Constants.ENABLE_ROUTE_MERGE; disabled by default until validated.
+     */
+    private static void mergeUnderutilizedRoutes(Solution sol) {
+        if (!Constants.ENABLE_ROUTE_MERGE) return;
+
+        boolean changed = true;
+        int guard = 0;
+
+        while (changed && guard < Constants.MERGE_IMPROVE_GUARD) {
+            changed = false;
+            guard++;
+
+            List<Integer> evIds = sol.evRoutes.stream()
+                    .map(r -> r.evId)
+                    .collect(Collectors.toList());
+
+            for (int i = 0; i < evIds.size() && !changed; i++) {
+                for (int j = 0; j < evIds.size() && !changed; j++) {
+                    if (i == j) continue;
+
+                    EVRoute routeA = findRouteByEvId(sol, evIds.get(i));
+                    EVRoute routeB = findRouteByEvId(sol, evIds.get(j));
+                    if (routeA == null || routeB == null) continue;
+                    if (routeA.customerIds.isEmpty() || routeB.customerIds.isEmpty()) continue;
+
+                    /*
+                     * Cross-cluster merges are allowed.  Nothing in the model ties a
+                     * customer to its nearest depot: Eq.3 lets an EV "return to any depot"
+                     * and Eq.2 only asks for a per-depot dispatch/return balance, which
+                     * assignPaperClosestEndDepots re-establishes inside the merge.  Only
+                     * Stage 1's clustering *heuristic* prefers the nearest depot.
+                     *
+                     * An earlier revision restricted this to routeA.startDepotId ==
+                     * routeB.startDepotId "for no clear benefit".  That premise was wrong:
+                     * on p01 the decoder emits exactly one route per depot, so the
+                     * restriction made this whole method a no-op and pinned ICGA at 4 EVs
+                     * (1200 of its 1340.69 cost) where ALNS reaches 2.
+                     */
+                    if (tryMergeRouteBIntoA(sol, routeA.evId, routeB.evId)) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    private static boolean tryMergeRouteBIntoA(Solution sol, int evIdA, int evIdB) {
+        Solution before = new Solution(sol);
+        double costBefore = sol.totalCost;
+
+        EVRoute a0 = findRouteByEvId(sol, evIdA);
+        EVRoute b0 = findRouteByEvId(sol, evIdB);
+        if (a0 == null || b0 == null) return false;
+
+        List<List<Integer>> orders = new ArrayList<>();
+
+        // Strategy 1 & 2: simple concatenation
+        List<Integer> aThenB = new ArrayList<>(a0.customerIds);
+        aThenB.addAll(b0.customerIds);
+        orders.add(aThenB);
+
+        List<Integer> bThenA = new ArrayList<>(b0.customerIds);
+        bThenA.addAll(a0.customerIds);
+        orders.add(bThenA);
+
+        // Strategy 3: greedy insertion — insert each of B into A at cheapest Euclidean position
+        orders.add(greedyMergeOrder(a0.customerIds, b0.customerIds, a0.startDepotId));
+        // Strategy 4: greedy in reverse — B as base, insert A's customers
+        orders.add(greedyMergeOrder(b0.customerIds, a0.customerIds, a0.startDepotId));
+
+        for (List<Integer> order : orders) {
+            restoreSolution(sol, before);
+
+            EVRoute a = findRouteByEvId(sol, evIdA);
+            EVRoute b = findRouteByEvId(sol, evIdB);
+            if (a == null || b == null) continue;
+
+            for (DroneTrip dt : sol.allDroneTrips) {
+                if (dt.launchEVId == b.evId)   dt.launchEVId   = a.evId;
+                if (dt.retrieveEVId == b.evId) dt.retrieveEVId = a.evId;
+            }
+
+            Set<DroneTrip> mergedTrips = Collections.newSetFromMap(new IdentityHashMap<>());
+            mergedTrips.addAll(a.droneTrips);
+            mergedTrips.addAll(b.droneTrips);
+            a.droneTrips = new ArrayList<>(mergedTrips);
+
+            a.customerIds = new ArrayList<>(order);
+            removeRouteByEvId(sol, b.evId);
+
+            if (!rebuildRouteWithBestTemporaryEndDepot(a)) continue;
+
+            // 2-opt on the merged route: may turn a time-infeasible order into a feasible one
+            intraRoute2Opt(a);
+
+            /*
+             * Route-level pre-check before the expensive whole-solution evaluation below.
+             * Capacity (Eq.9), SoC (Eq.10), operating hours (Eq.6/7) and drone-carry are
+             * necessary conditions, and rebuildRoute inside routeLevelFeasible is roughly
+             * two orders of magnitude cheaper than refreshAllRoutes + isFeasible.  Without
+             * this the merge is unaffordable: dropping the same-depot restriction takes
+             * p01 from 0 to 48 candidate merges per decode, inside every decode.
+             */
+            if (!routeLevelFeasible(a)) continue;
+
+            /*
+             * Merging across depots removes one dispatch from B's start depot, so the end
+             * depots must be re-assigned against the new start-depot multiset or Eq.2
+             * balance breaks and every cross-depot merge would be rejected below.
+             * assignPaperClosestEndDepots derives its quota from the current start depots,
+             * so it restores the balance by construction.
+             */
+            assignPaperClosestEndDepots(sol);
+
+            refreshAllRoutes(sol);
+            computeCost(sol);
+            boolean feasible = ConstraintChecker.isFeasible(sol);
+
+            if (feasible && sol.totalCost + 1e-6 < costBefore) {
+                return true;
+            }
+        }
+
+        restoreSolution(sol, before);
+        return false;
     }
 
     private static boolean launchBestPaperDroneFromEVNode(Solution sol,
@@ -1402,13 +1674,75 @@ public class Decoder {
         return true;
     }
     // ==========================================================
+    // Intra-route 2-opt
+    // ==========================================================
+
+    // Max reversal window for 2-opt: O(n × WINDOW) instead of O(n²).
+    private static final int TWO_OPT_WINDOW = 10;
+
+    /**
+     * 2-opt for a single EV route (no drone trips attached yet).
+     * Repeatedly reverses sub-segments [i..j] (|j-i| ≤ TWO_OPT_WINDOW) while
+     * routeLevelFeasible + energy improves.
+     */
+    static boolean intraRoute2Opt(EVRoute route) {
+        if (route.customerIds.size() < 3) return false;
+        boolean anyImproved = false;
+        boolean improved = true;
+        while (improved) {
+            improved = false;
+            List<Integer> ids = route.customerIds;
+            outer:
+            for (int i = 0; i < ids.size() - 1; i++) {
+                int jMax = Math.min(ids.size() - 1, i + TWO_OPT_WINDOW);
+                for (int j = i + 1; j <= jMax; j++) {
+                    EVRoute test = new EVRoute(route);
+                    Collections.reverse(test.customerIds.subList(i, j + 1));
+                    rebuildRoute(test, test.startDepotId, test.endDepotId);
+                    if (routeLevelFeasible(test) && test.energyUsed < route.energyUsed - 1e-9) {
+                        Collections.reverse(route.customerIds.subList(i, j + 1));
+                        rebuildRoute(route, route.startDepotId, route.endDepotId);
+                        improved = true;
+                        anyImproved = true;
+                        break outer;
+                    }
+                }
+            }
+        }
+        return anyImproved;
+    }
+
+    /**
+     * Greedy insertion order: insert each customer from bCustomers into aCustomers
+     * one by one at the cheapest Euclidean-delta position.
+     */
+    private static List<Integer> greedyMergeOrder(List<Integer> aCustomers,
+                                                   List<Integer> bCustomers,
+                                                   int depotId) {
+        List<Integer> result = new ArrayList<>(aCustomers);
+        for (int cid : bCustomers) {
+            int bestPos = result.size();
+            double bestDelta = Double.MAX_VALUE;
+            for (int pos = 0; pos <= result.size(); pos++) {
+                int prev = (pos == 0)              ? depotId : result.get(pos - 1);
+                int next = (pos == result.size())  ? depotId : result.get(pos);
+                double delta = DataLoader.distance(prev, cid) + DataLoader.distance(cid, next)
+                             - DataLoader.distance(prev, next);
+                if (delta < bestDelta) { bestDelta = delta; bestPos = pos; }
+            }
+            result.add(bestPos, cid);
+        }
+        return result;
+    }
+
+    // ==========================================================
     // Route rebuild / refresh / cost
     // ==========================================================
-    private static void refreshAllRoutes(Solution sol) {
+    static void refreshAllRoutes(Solution sol) {
         ScheduleEvaluator.evaluate(sol);
     }
 
-    private static void rebuildRoute(EVRoute route, int startDepotId, int endDepotId) {
+    static void rebuildRoute(EVRoute route, int startDepotId, int endDepotId) {
         Node startDepot = DataLoader.getDepot(startDepotId);
         Node endDepot = DataLoader.getDepot(endDepotId);
 
@@ -1485,11 +1819,11 @@ public class Decoder {
         return launches * (Constants.DRONE_T1 + Constants.DRONE_T2);
     }
 
-    private static void computeCost(Solution sol) {
+    static void computeCost(Solution sol) {
         ScheduleEvaluator.evaluate(sol);
     }
 
-    private static void pruneEmptyRoutes(Solution sol) {
+    static void pruneEmptyRoutes(Solution sol) {
         sol.evRoutes.removeIf(EVRoute::isRemovableEmptyRoute);
     }
 
@@ -1712,16 +2046,41 @@ public class Decoder {
 
     private static void improvePaperDepotDroneRetrieveByEV(Solution sol,
                                                            List<DroneState> droneStates) {
-        refreshAllRoutes(sol);
+        /*
+         * Fixed-point pass: a retrieve-node swap for one trip can change EV
+         * arrival/departure timing at nodes another trip depends on (Eq.26),
+         * so repeat until nothing improves, bounded by ROUTE_IMPROVE_GUARD.
+         * Not restricted to raw Depot->Customer->Depot trips: any trip's
+         * retrieve node (whether currently at a depot or already assigned to
+         * an EV) is a candidate, since the paper's Section 7.2 nearest-EV
+         * retrieval heuristic applies to any drone, not only depot-launched ones.
+         */
+        boolean anyChanged = true;
+        int guard = 0;
 
-        Set<Integer> droneServedCustomers = new HashSet<>();
-        for (DroneTrip dt : sol.allDroneTrips) {
-            droneServedCustomers.add(dt.serveNodeId);
+        while (anyChanged && guard < Constants.ROUTE_IMPROVE_GUARD) {
+            anyChanged = false;
+            guard++;
+            refreshAllRoutes(sol);
+
+            Set<Integer> droneServedCustomers = new HashSet<>();
+            for (DroneTrip dt : sol.allDroneTrips) {
+                droneServedCustomers.add(dt.serveNodeId);
+            }
+
+            for (DroneTrip trip : new ArrayList<>(sol.allDroneTrips)) {
+                if (improveOneDroneRetrieveByEV(sol, droneStates, trip, droneServedCustomers)) {
+                    anyChanged = true;
+                }
+            }
         }
+    }
 
-        for (DroneTrip trip : new ArrayList<>(sol.allDroneTrips)) {
-            if (trip.launchEVId > 0 || trip.retrieveEVId > 0) continue;
-
+    private static boolean improveOneDroneRetrieveByEV(Solution sol,
+                                                        List<DroneState> droneStates,
+                                                        DroneTrip trip,
+                                                        Set<Integer> droneServedCustomers) {
+        {
             double d1 = DataLoader.distance(trip.launchNodeId, trip.serveNodeId);
             DroneTrip bestCandidate = null;
             EVRoute bestRetrieveRoute = null;
@@ -1761,11 +2120,18 @@ public class Decoder {
             }
 
             if (bestCandidate == null || bestRetrieveRoute == null) {
-                continue;
+                return false;
             }
 
             Solution beforeCommit = new Solution(sol);
             List<DroneState> beforeStates = copyDroneStates(droneStates);
+
+            if (trip.retrieveEVId > 0 && trip.retrieveEVId != bestRetrieveRoute.evId) {
+                EVRoute oldRetrieveRoute = findRouteByEvId(sol, trip.retrieveEVId);
+                if (oldRetrieveRoute != null) {
+                    oldRetrieveRoute.droneTrips.remove(trip);
+                }
+            }
 
             trip.retrieveNodeId = bestCandidate.retrieveNodeId;
             trip.retrieveEVId = bestCandidate.retrieveEVId;
@@ -1786,7 +2152,7 @@ public class Decoder {
                 restoreSolution(sol, beforeCommit);
                 droneStates.clear();
                 droneStates.addAll(beforeStates);
-                continue;
+                return false;
             }
 
             for (DroneState state : droneStates) {
@@ -1797,6 +2163,8 @@ public class Decoder {
                     state.nextTripIndex = Math.max(state.nextTripIndex, trip.tripIndex + 1);
                 }
             }
+
+            return true;
         }
     }
 
@@ -2187,7 +2555,7 @@ public class Decoder {
      * Với cùng một node, thứ tự thao tác được phép linh hoạt theo Fig.3 của paper:
      * launch drone đang carry, retrieve drone khác, rồi có thể relaunch drone vừa retrieve.
      */
-    private static boolean routeDroneCarryFeasible(EVRoute route) {
+    static boolean routeDroneCarryFeasible(EVRoute route) {
         int onboard = 1; // mỗi EV có thể rời depot với tối đa một drone; heuristic hiện dùng một drone seed/EV
 
         for (int nodeId : route.customerIds) {
@@ -2408,7 +2776,7 @@ public class Decoder {
         }
     }
     private static class OpenDepotAssignment {
-        double totalEnergy;
+        double totalReturnDistance;
         int[] endDepots;
     }
 }
