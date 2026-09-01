@@ -134,7 +134,13 @@ public class Decoder {
     // ==========================================================
     // Stage 1: depot drones
     // ==========================================================
-    private static Set<Integer> assignDepotDrones(Solution sol, List<Integer> chromosome) {
+    /**
+     * Stage 1 of the paper's decode.  Package-private rather than private because ALNS
+     * needs it too: depot-launched drone trips are part of the problem's solution
+     * structure, not an ICGA search decision -- the assignment sorts each depot cluster by
+     * distance, so its output does not depend on the chromosome order at all.
+     */
+    static Set<Integer> assignDepotDrones(Solution sol, List<Integer> chromosome) {
         Set<Integer> served = new HashSet<>();
 
         Map<Integer, List<Integer>> clusters = new LinkedHashMap<>();

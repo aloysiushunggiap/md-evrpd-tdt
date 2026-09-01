@@ -123,19 +123,28 @@ public class Constants {
     // Đây là upper bound heuristic, không phải ràng buộc paper.
     public static final int MAX_DEPOT_DRONES_PER_DEPOT = 4;
 
+    /** NOT WIRED UP: only reachable via findBestInsertion -> buildGlobalEVRoutes, both legacy. */
     public static final int STAGE2_INSERT_NEAREST_POSITIONS = 2;
 
     /*
-     * Stage 3 search window.  These are heuristic knobs of this implementation, NOT paper
-     * parameters -- the paper prescribes the Stage 3 procedure but no candidate limits.
-     * Widening them lets Stage 3 consider more drone assignments, which shortens EV routes
-     * and makes route merging easier, at a roughly proportional cost in runtime.
+     * NOT WIRED UP.  These look like live Stage 3 tuning knobs but the production decoder
+     * never reads them: the only readers are the legacy non-Paper helpers
+     * (assignCollaborativeDroneTrips, candidateDroneCustomersWholeSolution,
+     * candidateRetrieveNodesAfterLaunch / ...OnRouteLight), none of which is on the solve
+     * path.  The live path uses candidateDroneCustomersPaper /
+     * candidateRetrieveNodesAfterLaunchPaper / candidateRetrieveNodesOnRoutePaper, which
+     * enumerate exhaustively and apply no candidate limit at all.
+     *
+     * Kept only because the legacy reference code still references them; changing these
+     * values has no effect on any result (measured: p01 unchanged at 730.65).
      */
-    public static final int STAGE3_MAX_ROUNDS = 20;
+    public static final int STAGE3_MAX_ROUNDS = 10;
     public static final int STAGE3_LAUNCH_LOOKAHEAD = 8;
-    public static final int STAGE3_SERVE_CANDIDATES = 24;
-    public static final int STAGE3_RETRIEVE_CANDIDATES = 24;
+    public static final int STAGE3_SERVE_CANDIDATES = 12;
+    public static final int STAGE3_RETRIEVE_CANDIDATES = 12;
 
+    /** NOT WIRED UP: the big-M of Eq.11/12/26/... is never materialised; the checker
+     *  compares the schedule directly instead. */
     public static final double BIG_M = 1e6;
 
     // =========================================================

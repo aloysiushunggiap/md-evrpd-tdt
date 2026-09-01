@@ -110,11 +110,16 @@ public final class ConstraintChecker {
         for (Map.Entry<Integer, Integer> entry : launchesAtCustomer.entrySet()) {
             int nodeId = entry.getKey();
             int launches = entry.getValue();
-            int retrieves = retrievesAtCustomer.getOrDefault(nodeId, 0);
             if (droneServed.contains(nodeId)) out.add("Eq.22: drone-served customer " + nodeId + " launches a drone");
             if (launches > 2) out.add("Eq.29: more than two launches at customer " + nodeId);
-            if (launches == 2 && retrieves != 1 && !hasInboundDrone(routeById, nodeId)) {
-                out.add("Eq.28/29: two launches at " + nodeId + " lack a carried/retrieved drone");
+            /*
+             * Eq.29 reads: launches at i <= 1 + (a drone was carried into i).  "If an EV
+             * carries a drone to a node, this node can launch two drones at most, otherwise
+             * one."  A retrieval at the node does not appear in Eq.29, so it cannot license
+             * the second launch on its own.
+             */
+            if (launches == 2 && !hasInboundDrone(routeById, nodeId)) {
+                out.add("Eq.29: two launches at " + nodeId + " without a drone carried in");
             }
         }
         for (Map.Entry<Integer, Integer> entry : retrievesAtCustomer.entrySet()) {

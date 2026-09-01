@@ -12,8 +12,14 @@ import java.util.*;
  *
  * Luồng thuật toán:
  *
+ * ALNS chạy ĐỘC LẬP với ICGA: nó tự dựng lời giải khởi tạo và không bao giờ trả về lời
+ * giải do ICGA sinh ra. Phần dùng chung với ICGA chỉ là máy móc của MÔ HÌNH — Stage 1
+ * (drone depot), Stage 3 (tích hợp EV–drone), ScheduleEvaluator, ConstraintChecker — vốn
+ * không thuộc về thuật toán nào và phải giống nhau thì so sánh mới có nghĩa.
+ *
  * 1. KHỞI TẠO
- *    - Decode initial solution bằng Decoder.decodePaperICGA (Stage 1–3 đầy đủ + 2-opt).
+ *    - buildInitialSolution: Stage 1 depot drone, rồi chèn tham lam từng khách còn lại
+ *      bằng chính insertBest/openNewRoute của ALNS, rồi Stage 3.
  *
  * 2. VÒNG LẶP CHÍNH:
  *    a. DESTROY — chọn operator theo trọng số adaptive (roulette wheel):
@@ -126,9 +132,8 @@ public class ALNS {
         // Each ALNS "generation" runs the same number of evaluations as one ICGA generation.
         int itersPerGen = 3 * popSize * Constants.OPERATOR_TRIALS;
 
-        // Full initial decode (Stage 1–3) to get a good starting solution.
-        Solution initSol = Decoder.decodePaperICGA(buildInitialChromosome());
-        nextEvId = initSol.evRoutes.stream().mapToInt(r -> r.evId).max().orElse(0) + 1;
+        // ALNS builds its own starting solution -- see buildInitialSolution().
+        Solution initSol = buildInitialSolution();
 
         // Working copy: EV routes plus the Stage 1 depot-drone trips, no Stage 3 output
         // (lazy Stage 3).  The depot-drone trips must be kept -- their customers are in no
@@ -300,7 +305,12 @@ public class ALNS {
             bestSol = finalProbe;
         }
 
-        return bestSol != null ? bestSol : initSol;
+        /*
+         * If nothing ever validated, return ALNS's own last probe rather than falling back
+         * to some other solver's answer, so Main reports the real violations instead of
+         * hiding them behind a solution this run did not produce.
+         */
+        return bestSol != null ? bestSol : finalProbe;
     }
 
     // ==========================================================
@@ -539,16 +549,52 @@ public class ALNS {
     // Helpers
     // ==========================================================
 
-    private static List<Integer> buildInitialChromosome() {
-        List<Node> customers = new ArrayList<>(DataLoader.customers);
-        customers.sort((a, b) -> {
+    /**
+     * Build ALNS's own starting solution, without decoding an ICGA chromosome.
+     *
+     * A --alns run must share no *search* decision with --icga, otherwise the comparison
+     * measures what local search adds on top of ICGA rather than the two algorithms
+     * against each other.  Previously this method produced a chromosome that was fed to
+     * Decoder.decodePaperICGA, so ALNS started from exactly the answer ICGA converges to
+     * and could never come back worse.
+     *
+     * What stays shared is *model* machinery, which every solver for this problem needs
+     * and which belongs to no algorithm: Stage 1 depot drones, Stage 3 EV-drone
+     * integration, ScheduleEvaluator and ConstraintChecker.  Stage 1 in particular sorts
+     * each depot cluster by distance, so its result is identical whichever solver asks
+     * for it.
+     *
+     * The EV routes themselves are built here by ALNS's own greedy insertion -- the same
+     * insertBest / openNewRoute used by its repair operators -- rather than by the paper's
+     * Stage 2.
+     */
+    private static Solution buildInitialSolution() {
+        Solution sol = new Solution();
+        nextEvId = 1;
+
+        List<Integer> customerIds = new ArrayList<>();
+        for (Node c : DataLoader.customers) customerIds.add(c.id);
+
+        // Stage 1: depot -> customer -> depot drone trips.
+        Set<Integer> servedByDepotDrone = Decoder.assignDepotDrones(sol, customerIds);
+
+        // Remaining customers, grouped by nearest depot then near-to-far, so greedy
+        // insertion starts from a geographically coherent order.
+        List<Node> remaining = new ArrayList<>();
+        for (Node c : DataLoader.customers) {
+            if (!servedByDepotDrone.contains(c.id)) remaining.add(c);
+        }
+        remaining.sort((a, b) -> {
             Node da = nearestDepot(a), db = nearestDepot(b);
             if (da.id != db.id) return Integer.compare(da.id, db.id);
             return Double.compare(DataLoader.distance(a.id, da.id), DataLoader.distance(b.id, db.id));
         });
-        List<Integer> chr = new ArrayList<>();
-        for (Node c : customers) chr.add(c.id);
-        return chr;
+
+        for (Node c : remaining) insertBest(sol, c.id);
+
+        rebuildAllRoutes(sol);
+        Decoder.runStage3AndEvaluate(sol);
+        return sol;
     }
 
     private static Node nearestDepot(Node c) {

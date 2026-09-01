@@ -16,7 +16,7 @@ public class Main {
 
         String instanceArg = "p06";
         boolean exportCsv = false;
-        String solver = "icga";
+        String solver = "alns";
 
         for (String arg : args) {
             if ("--csv".equalsIgnoreCase(arg))   exportCsv = true;
